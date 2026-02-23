@@ -1,12 +1,12 @@
-# **CloudCradle**
+# **CloudBooter**
 
 *Effortless Oracle Cloud Always-Free Tier Deployment*
 
 ---
 
-## 🌟 What is CloudCradle?
+## 🌟 What is CloudBooter?
 
-**CloudCradle** is an out-of-the-box solution for standing up a fully functional Oracle Cloud Infrastructure (OCI) environment — **exclusively using resources from the "Always Free" tier**.
+**CloudBooter** is an out-of-the-box solution for standing up a fully functional Oracle Cloud Infrastructure (OCI) environment — **exclusively using resources from the "Always Free" tier**.
 
 It provides both **Bash** and **Python** implementations to handle the complex setup steps that typically frustrate developers working with OCI.
 
@@ -27,7 +27,7 @@ stuck. Eventually we all have to read the 100 pages of outdated documentation an
 trial and error--until now. It's probably why OCI gives you a trial month to do pretty much anything for free, 
 otherwise I'm certain I would have triggered billing accidentally and woke up to a mess.
 
-**CloudCradle was born to save others the headache.**
+**CloudBooter was born to save others the headache.**
 I wanted a setup where:
 
 * You don’t have to bounce between docs and dashboards.
@@ -109,8 +109,8 @@ oracle-cloud-terraform/
 ## 📦 Setup Instructions
 
 ```bash
-git clone https://github.com/bolabaden/cloudcradle.git
-cd cloudcradle
+git clone https://github.com/bolabaden/cloudbooter.git
+cd cloudbooter
 ./setup_oci_terraform.sh                    # Installs and configures OCI CLI, auths through the browser, sets up a python venv
 # [SUCCESS] All setup verification checks passed!
 # [SUCCESS] ==================== SETUP COMPLETE ====================
@@ -132,7 +132,7 @@ cd cloudcradle
 
 ### Switching OCI accounts / profiles
 
-OCI CLI authentication is stored in `~/.oci/config` using named *profiles* (e.g. `DEFAULT`, `MYACCOUNT`, etc). CloudCradle will **reuse an existing working profile by default**.
+OCI CLI authentication is stored in `~/.oci/config` using named *profiles* (e.g. `DEFAULT`, `MYACCOUNT`, etc). CloudBooter will **reuse an existing working profile by default**.
 
 If you want to log in as a different OCI account (or just create a separate profile), run:
 
@@ -148,8 +148,8 @@ OCI_PROFILE=MYPROFILE ./setup_oci_terraform.sh
 ```
 
 About the “choose a region” and “create a profile” prompts:
-- `oci session authenticate` requires a `--region`. If your profile already has a region configured, CloudCradle will reuse it; otherwise, OCI CLI will prompt you to choose one.
-- `oci session authenticate` is designed to *create/update a session profile*. CloudCradle passes the profile name automatically (so you should not be forced to re-type it), but OCI will still prompt if required values are missing.
+- `oci session authenticate` requires a `--region`. If your profile already has a region configured, CloudBooter will reuse it; otherwise, OCI CLI will prompt you to choose one.
+- `oci session authenticate` is designed to *create/update a session profile*. CloudBooter passes the profile name automatically (so you should not be forced to re-type it), but OCI will still prompt if required values are missing.
 
 To skip the region selection menu during browser auth:
 
@@ -157,7 +157,7 @@ To skip the region selection menu during browser auth:
 OCI_AUTH_REGION=us-chicago-1 ./setup_oci_terraform.sh
 ```
 
-Session tokens are time-bounded by OCI (commonly up to ~60 minutes). CloudCradle will attempt `oci session refresh` when it detects an expired session; you can also refresh manually:
+Session tokens are time-bounded by OCI (commonly up to ~60 minutes). CloudBooter will attempt `oci session refresh` when it detects an expired session; you can also refresh manually:
 
 ```bash
 oci session refresh --profile MYPROFILE
@@ -196,7 +196,7 @@ The helper logs to `scripts/out_of_capacity.log` so you can inspect attempts and
 
 ## 🔍 Accessibility Philosophy
 
-CloudCradle emphasizes:
+CloudBooter emphasizes:
 
 * **Clear logging**: Know what's happening at each step.
 * **Descriptive naming**: From variables to resources, it all makes sense.
@@ -225,7 +225,7 @@ This is a growing project aimed at the community — especially those trying to 
 
 ## 📛 Name Origin
 
-> “CloudCradle” — because this project gently rocks your Oracle Cloud setup into life, taking care of the heavy lifting, while you rest easy.
+> "CloudBooter" — because this project boots up your Oracle Cloud infrastructure swiftly and reliably, getting you up and running without the hassle.
 
 ---
 

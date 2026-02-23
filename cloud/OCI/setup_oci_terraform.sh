@@ -2295,71 +2295,16 @@ resource "oci_core_default_security_list" "main" {
     protocol    = "all"
   }
   
-  # SSH (IPv4)
+  # Allow ALL ingress traffic on ALL ports and ALL protocols (IPv4)
+  # OCI Security List: protocol "all" with no tcp/udp options = every port, every protocol
+  # Eliminates the need to manually open ports in the OCI console after deployment.
   ingress_security_rules {
-    protocol = "6"
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 22
-      max = 22
-    }
-  }
-  # SSH (IPv6)
-  ingress_security_rules {
-    protocol = "6"
-    source   = "::/0"
-    tcp_options {
-      min = 22
-      max = 22
-    }
-  }
-  
-  # HTTP (IPv4)
-  ingress_security_rules {
-    protocol = "6"
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 80
-      max = 80
-    }
-  }
-  # HTTP (IPv6)
-  ingress_security_rules {
-    protocol = "6"
-    source   = "::/0"
-    tcp_options {
-      min = 80
-      max = 80
-    }
-  }
-  
-  # HTTPS (IPv4)
-  ingress_security_rules {
-    protocol = "6"
-    source   = "0.0.0.0/0"
-    tcp_options {
-      min = 443
-      max = 443
-    }
-  }
-  # HTTPS (IPv6)
-  ingress_security_rules {
-    protocol = "6"
-    source   = "::/0"
-    tcp_options {
-      min = 443
-      max = 443
-    }
-  }
-  
-  # ICMP (IPv4)
-  ingress_security_rules {
-    protocol = "1"
+    protocol = "all"
     source   = "0.0.0.0/0"
   }
-  # ICMP (IPv6)
+  # Allow ALL ingress traffic on ALL ports and ALL protocols (IPv6)
   ingress_security_rules {
-    protocol = "1"
+    protocol = "all"
     source   = "::/0"
   }
 }

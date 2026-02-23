@@ -3,31 +3,36 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "oci-terraform-setup"
-version = "1.0.0"
-description = "Oracle Cloud Infrastructure Terraform Setup Tool"
-authors = [{name = "OCI Terraform Setup", email = "setup@example.com"}]
+name = "cloudbooter"
+version = "0.1.0"
+description = "Terraform Setup and Bootstrap Tools for various Cloud Infrastructures like Oracle Cloud or GCP."
+authors = [
+    {"name" = "Boden Crouch", "email" = "contact@bolabaden.org"}
+]
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "oci>=2.155.0",
-    "python-terraform>=1.0.0",
-    "cryptography>=3.2.1",
     "click>=8.0.0",
-    "rich>=13.0.0",
-    "pyyaml>=5.4",
+    "cryptography>=3.2.1",
     "jinja2>=3.0.0",
+    "python-terraform>=0.10.1",
+    "pyyaml>=5.4",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.0.0",
     "black>=22.0.0",
     "flake8>=4.0.0",
+    "ruff>=0.1.0",
 ]
 
 [project.scripts]
-oci-terraform-setup = "oci_terraform_setup.cli:main"
+cloudbooter = "cloudbooter.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

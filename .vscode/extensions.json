@@ -1,6 +1,5 @@
 {
     "recommendations": [
-        "hashicorp.terraform",
-        "charliermarsh.ruff"
+        "hashicorp.terraform"
     ]
 }

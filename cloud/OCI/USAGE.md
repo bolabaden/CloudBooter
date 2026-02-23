@@ -1,10 +1,10 @@
 # Bash Implementation
 
-The Bash implementation is the original and most mature version of CloudCradle. It's recommended for Linux and macOS users.
+The Bash implementation is the original and most mature version of Cloudbooter. It's recommended for Linux and macOS users.
 
 ## Features
 
-- Full-featured implementation with all CloudCradle capabilities
+- Full-featured implementation with all Cloudbooter capabilities
 - Cross-platform support (Linux, macOS, WSL)
 - No dependencies beyond standard Unix tools and OCI CLI
 - Comprehensive error handling and retry logic
@@ -95,4 +95,4 @@ The script automatically detects WSL and handles browser authentication appropri
 ## See Also
 
 - [Main README](../../README.md)
-- [Free Tier Guide](../../docs/FREE_TIER.md)
+- [Free Tier Guide](FREE_TIER_LIMITS.md)
