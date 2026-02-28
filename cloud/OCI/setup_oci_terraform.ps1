@@ -1,18 +1,8 @@
 # Oracle Cloud Infrastructure (OCI) Terraform Setup Script
-# Idempotent, comprehensive implementation for Always Free Tier management
 #
 # Usage:
-#   Interactive mode:        .\setup_oci_terraform.ps1
-#   Non-interactive mode:    $env:NON_INTERACTIVE='true'; $env:AUTO_USE_EXISTING='true'; $env:AUTO_DEPLOY='true'; .\setup_oci_terraform.ps1
-#   Use existing config:     $env:AUTO_USE_EXISTING='true'; .\setup_oci_terraform.ps1
-#   Auto deploy only:        $env:AUTO_DEPLOY='true'; .\setup_oci_terraform.ps1
-#   Skip to deploy:          $env:SKIP_CONFIG='true'; .\setup_oci_terraform.ps1
+#   TUI mode (recommended):  .\setup_oci_terraform.ps1
 #
-# Key features:
-#   - Completely idempotent: safe to run multiple times
-#   - Comprehensive resource detection before any deployment
-#   - Strict Free Tier limit validation
-#   - Robust existing resource import
 
 $ErrorActionPreference = 'Stop'
 
@@ -20,13 +10,12 @@ $ErrorActionPreference = 'Stop'
 # CONFIGURATION AND CONSTANTS
 # ============================================================================
 
-# Non-interactive mode support
-$NON_INTERACTIVE = if ($env:NON_INTERACTIVE) { $env:NON_INTERACTIVE } else { 'false' }
-$AUTO_USE_EXISTING = if ($env:AUTO_USE_EXISTING) { $env:AUTO_USE_EXISTING } else { 'false' }
-$AUTO_DEPLOY = if ($env:AUTO_DEPLOY) { $env:AUTO_DEPLOY } else { 'false' }
-$SKIP_CONFIG = if ($env:SKIP_CONFIG) { $env:SKIP_CONFIG } else { 'false' }
+# TUI-first execution model
 $DEBUG = if ($env:DEBUG) { $env:DEBUG } else { 'false' }
 $FORCE_REAUTH = if ($env:FORCE_REAUTH) { $env:FORCE_REAUTH } else { 'false' }
+$LOG_LEVEL = if ($env:LOG_LEVEL) { $env:LOG_LEVEL.ToUpperInvariant() } else { 'INFO' }
+$LOG_TIMESTAMPS = if ($env:LOG_TIMESTAMPS) { $env:LOG_TIMESTAMPS } else { 'true' }
+$LOG_CATALOG_SIZE = if ($env:LOG_CATALOG_SIZE) { [int]$env:LOG_CATALOG_SIZE } else { 900 }
 
 # Optional Terraform remote backend (set to 'oci' to use OCI Object Storage S3-compatible backend)
 $TF_BACKEND = if ($env:TF_BACKEND) { $env:TF_BACKEND } else { 'local' }                # values: local | oci
@@ -47,12 +36,20 @@ $OCI_CMD_TIMEOUT = if ($env:OCI_CMD_TIMEOUT) { [int]$env:OCI_CMD_TIMEOUT } else 
 # If no coreutils timeout is available, the script attempts to still run but may block on slow OCI CLI calls.
 
 # OCI CLI configuration
-$OCI_CONFIG_FILE = if ($env:OCI_CONFIG_FILE) { $env:OCI_CONFIG_FILE } else { "$env:USERPROFILE\.oci\config" }
+$_ociHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+$OCI_CONFIG_FILE = if ($env:OCI_CONFIG_FILE) { $env:OCI_CONFIG_FILE } else { Join-Path $_ociHome '.oci' 'config' }
 $OCI_PROFILE = if ($env:OCI_PROFILE) { $env:OCI_PROFILE } else { 'DEFAULT' }
 $OCI_AUTH_REGION = if ($env:OCI_AUTH_REGION) { $env:OCI_AUTH_REGION } else { '' }
 $OCI_CLI_CONNECTION_TIMEOUT = if ($env:OCI_CLI_CONNECTION_TIMEOUT) { [int]$env:OCI_CLI_CONNECTION_TIMEOUT } else { 10 }
 $OCI_CLI_READ_TIMEOUT = if ($env:OCI_CLI_READ_TIMEOUT) { [int]$env:OCI_CLI_READ_TIMEOUT } else { 60 }
 $OCI_CLI_MAX_RETRIES = if ($env:OCI_CLI_MAX_RETRIES) { [int]$env:OCI_CLI_MAX_RETRIES } else { 3 }
+
+if (-not $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING) {
+    $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING = 'True'
+}
+if (-not $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_CHECK) {
+    $env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_CHECK = 'True'
+}
 
 # Oracle Free Tier Limits (as of 2025)
 $FREE_TIER_MAX_AMD_INSTANCES = 2
@@ -74,6 +71,18 @@ $CYAN = [char]27 + '[0;36m'
 $MAGENTA = [char]27 + '[0;35m'
 $BOLD = [char]27 + '[1m'
 $NC = [char]27 + '[0m' # No Color
+
+# Accessibility: disable ANSI colors when NO_COLOR is enabled
+if ($env:NO_COLOR -eq '1' -or $env:NO_COLOR -eq 'true') {
+    $RED = ''
+    $GREEN = ''
+    $YELLOW = ''
+    $BLUE = ''
+    $CYAN = ''
+    $MAGENTA = ''
+    $BOLD = ''
+    $NC = ''
+}
 
 # Global state tracking
 $tenancy_ocid = ''
@@ -108,45 +117,152 @@ $arm_flex_block_volumes = @()
 $amd_micro_hostnames = @()
 $arm_flex_hostnames = @()
 
+# TUI workflow state
+$TUI_BOOTSTRAPPED = $false
+$TUI_DISCOVERED = $false
+$TUI_CONFIGURED = $false
+$TUI_TERRAFORM_FILES_READY = $false
+$TUI_CLEAR_SCREEN = if ($env:TUI_CLEAR_SCREEN) { $env:TUI_CLEAR_SCREEN } else { 'true' }
+$TUI_ASCII_ONLY = if ($env:TUI_ASCII_ONLY) { $env:TUI_ASCII_ONLY } else { 'false' }
+$TUI_SHOW_HINTS = if ($env:TUI_SHOW_HINTS) { $env:TUI_SHOW_HINTS } else { 'true' }
+$TUI_CONCISE_LOGS = if ($env:TUI_CONCISE_LOGS) { $env:TUI_CONCISE_LOGS } else { 'true' }
+$TUI_LAST_ACTION = ''
+$LAST_GENERATED_CONFIG_SIGNATURE = ''
+
 # ============================================================================
 # LOGGING FUNCTIONS
 # ============================================================================
 
+$LOG_LEVEL_PRIORITIES = @{
+    'VERBOSE' = 10
+    'DEBUG'   = 20
+    'INFO'    = 30
+    'SUCCESS' = 35
+    'WARNING' = 40
+    'ERROR'   = 50
+}
+
+$LOG_MESSAGE_CATALOG = @{}
+
+function should_log {
+    param([string]$level)
+
+    $normalizedLevel = if ($level) { $level.ToUpperInvariant() } else { 'INFO' }
+    $currentLevel = if ($LOG_LEVEL) { $LOG_LEVEL.ToUpperInvariant() } else { 'INFO' }
+
+    if (-not $LOG_LEVEL_PRIORITIES.ContainsKey($normalizedLevel)) {
+        $normalizedLevel = 'INFO'
+    }
+    if (-not $LOG_LEVEL_PRIORITIES.ContainsKey($currentLevel)) {
+        $currentLevel = 'INFO'
+    }
+
+    return ($LOG_LEVEL_PRIORITIES[$normalizedLevel] -ge $LOG_LEVEL_PRIORITIES[$currentLevel])
+}
+
+function write_log {
+    param([string]$level, [string]$message)
+
+    $normalizedLevel = if ($level) { $level.ToUpperInvariant() } else { 'INFO' }
+    if (-not (should_log $normalizedLevel)) {
+        return
+    }
+
+    $labelColor = switch ($normalizedLevel) {
+        'VERBOSE' { $MAGENTA }
+        'DEBUG'   { $CYAN }
+        'INFO'    { $BLUE }
+        'SUCCESS' { $GREEN }
+        'WARNING' { $YELLOW }
+        'ERROR'   { $RED }
+        default   { $BLUE }
+    }
+
+    $prefix = if ($LOG_TIMESTAMPS -eq 'true') {
+        "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))][$normalizedLevel]"
+    }
+    else {
+        "[$normalizedLevel]"
+    }
+
+    Write-Host "$labelColor$prefix$NC $message"
+}
+
+function initialize_log_catalog {
+    if ($LOG_MESSAGE_CATALOG.Count -gt 0) {
+        return
+    }
+
+    for ($i = 1; $i -le $LOG_CATALOG_SIZE; $i++) {
+        $catalogLevel = switch ($i % 5) {
+            0 { 'ERROR' }
+            1 { 'VERBOSE' }
+            2 { 'DEBUG' }
+            3 { 'INFO' }
+            default { 'WARNING' }
+        }
+        $key = ('CB-{0:D4}' -f $i)
+        $LOG_MESSAGE_CATALOG[$key] = "[$catalogLevel] CloudBooter telemetry template message $i"
+    }
+
+    write_log 'DEBUG' "Initialized logging catalog with $($LOG_MESSAGE_CATALOG.Count) templates"
+}
+
+function print_verbose {
+    param([string]$message)
+    write_log 'VERBOSE' $message
+}
+
 function print_status {
     param([string]$message)
-    Write-Host "$($BLUE)[INFO]$($NC) $message"
+    write_log 'INFO' $message
 }
 
 function print_success {
     param([string]$message)
-    Write-Host "$($GREEN)[SUCCESS]$($NC) $message"
+    write_log 'SUCCESS' $message
 }
 
 function print_warning {
     param([string]$message)
-    Write-Host "$($YELLOW)[WARNING]$($NC) $message"
+    write_log 'WARNING' $message
 }
 
 function print_error {
     param([string]$message)
-    Write-Host "$($RED)[ERROR]$($NC) $message"
+    write_log 'ERROR' $message
 }
 
 function print_debug {
     param([string]$message)
-    if ($DEBUG -eq 'true') {
-        Write-Host "$($CYAN)[DEBUG]$($NC) $message"
+    if ($DEBUG -eq 'true' -or $LOG_LEVEL -eq 'DEBUG' -or $LOG_LEVEL -eq 'VERBOSE') {
+        write_log 'DEBUG' $message
     }
 }
 
 function prompt_with_default {
     param([string]$prompt, [string]$default_value)
     $userInput = Read-Host "$($BLUE)$prompt [$default_value]: $($NC)"
-    if ([string]::IsNullOrEmpty($userInput)) {
+    $userInput = if ($null -eq $userInput) { '' } else { $userInput.Trim() }
+    if ([string]::IsNullOrEmpty($userInput) -or $userInput -eq ':') {
         $default_value
     } else {
         $userInput
     }
+}
+
+function normalize_bool_input {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    return $Value.Trim().ToLowerInvariant()
+}
+
+function get_tui_rule {
+    param([int]$Length = 64, [string]$Char = '=')
+    return ($Char * $Length)
 }
 
 function prompt_int_range {
@@ -164,17 +280,23 @@ function prompt_int_range {
 
 function print_header {
     param([string]$title)
+    $lineChar = if ($TUI_ASCII_ONLY -eq 'true') { '=' } else { '═' }
+    $line = get_tui_rule 64 $lineChar
     Write-Host ""
-    Write-Host "$($BOLD)$($MAGENTA)════════════════════════════════════════════════════════════════$($NC)"
+    Write-Host "$($BOLD)$($MAGENTA)$line$($NC)"
     Write-Host "$($BOLD)$($MAGENTA)  $title$($NC)"
-    Write-Host "$($BOLD)$($MAGENTA)════════════════════════════════════════════════════════════════$($NC)"
+    Write-Host "$($BOLD)$($MAGENTA)$line$($NC)"
     Write-Host ""
 }
 
 function print_subheader {
     param([string]$title)
+    $lineChar = if ($TUI_ASCII_ONLY -eq 'true') { '-' } else { '─' }
+    $line = get_tui_rule 40 $lineChar
     Write-Host ""
-    Write-Host "$($BOLD)$($CYAN)── $title ──$($NC)"
+    Write-Host "$($BOLD)$($CYAN)$line$($NC)"
+    Write-Host "$($BOLD)$($CYAN)$title$($NC)"
+    Write-Host "$($BOLD)$($CYAN)$line$($NC)"
     Write-Host ""
 }
 
@@ -193,10 +315,19 @@ function command_exists {
     }
 }
 
-function is_wsl {
-    if ($env:WSL_DISTRO_NAME) {
-        return $true
+function is_headless_environment {
+    # Detect if we're in a headless (no GUI / no browser) environment.
+    # PowerShell runs on Windows, macOS, and Linux — detect each.
+    if ($IsLinux) {
+        # Check for DISPLAY (X11) or WAYLAND_DISPLAY or SSH_CONNECTION
+        if (-not $env:DISPLAY -and -not $env:WAYLAND_DISPLAY) {
+            return $true
+        }
+        if ($env:SSH_CONNECTION -or $env:SSH_TTY) {
+            return $true
+        }
     }
+    # On Windows and macOS, assume GUI is available
     return $false
 }
 
@@ -223,18 +354,23 @@ function open_url_best_effort {
         return $false
     }
 
-    if (is_wsl -and (command_exists 'powershell.exe')) {
-        try {
-            & powershell.exe -NoProfile -Command "Start-Process '$url'" 2>$null
-            return $true
-        }
-        catch {
-            return $false
-        }
-    }
-
     try {
-        Start-Process $url
+        if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
+            # Windows (including Windows PowerShell 5.x where $IsWindows may not exist)
+            Start-Process $url
+        }
+        elseif ($IsMacOS) {
+            & open $url 2>$null
+        }
+        else {
+            # Linux — try xdg-open
+            if (command_exists 'xdg-open') {
+                & xdg-open $url 2>$null
+            }
+            else {
+                return $false
+            }
+        }
         return $true
     }
     catch {
@@ -248,18 +384,22 @@ function read_oci_config_value {
         return $null
     }
     $content = Get-Content $file -Raw
-    $section = ""
-    foreach ($line in ($content -split "`n")) {
-        if ($line -match '^\s*\[') {
-            $section = $line
+    $targetSection = "[$prof]"
+    $section = ''
+    foreach ($rawLine in ($content -split "`n")) {
+        $line = $rawLine.Trim()
+        if ([string]::IsNullOrEmpty($line) -or $line.StartsWith('#') -or $line.StartsWith(';')) {
+            continue
         }
-        elseif ($section -eq "[$prof]") {
-            $line = $line -replace '^\s+', ''
-            if ($line -match "^$key\s*=") {
-                $line = $line -replace "^$key\s*=", ''
-                $line = $line -replace '^\s+', '' -replace '\s+$', ''
-                return $line
-            }
+
+        if ($line -match '^\[(.+)\]$') {
+            $section = "[$($Matches[1].Trim())]"
+            continue
+        }
+
+        if ($section -eq $targetSection -and $line -match "^$([regex]::Escape($key))\s*=") {
+            $value = $line -replace "^$([regex]::Escape($key))\s*=", ''
+            return $value.Trim()
         }
     }
     return $null
@@ -283,6 +423,8 @@ function validate_existing_oci_config {
         print_warning "OCI config not found at $OCI_CONFIG_FILE"
         return $false
     }
+
+    $script:auth_method = ''
 
     $cfg_auth = read_oci_config_value 'auth'
     $key_file = read_oci_config_value 'key_file'
@@ -338,53 +480,204 @@ function validate_existing_oci_config {
     return $true
 }
 
+# Resolve the full path to the oci executable, preferring the venv copy.
+# Caches in $script:oci_exe so subsequent calls are fast.
+function resolve_oci_exe {
+    if ($script:oci_exe -and (Test-Path $script:oci_exe -ErrorAction SilentlyContinue)) {
+        return $script:oci_exe
+    }
+    # Try Get-Command first (works when venv is activated)
+    $found = Get-Command oci -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) {
+        $script:oci_exe = $found.Source
+        return $script:oci_exe
+    }
+    # Fallback: check venv Scripts/bin directly
+    $venvBin = if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) { 'Scripts' } else { 'bin' }
+    $venvOci = Join-Path $PWD ".venv" $venvBin "oci"
+    if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
+        $venvOci = Join-Path $PWD ".venv" $venvBin "oci.exe"
+    }
+    if (Test-Path $venvOci) {
+        $script:oci_exe = $venvOci
+        return $script:oci_exe
+    }
+    throw "Cannot find 'oci' executable. Ensure OCI CLI is installed."
+}
+
+# Tokenize a command string respecting single and double quotes.
+# E.g. "--operating-system 'Canonical Ubuntu'" → @('--operating-system', 'Canonical Ubuntu')
+function tokenize_cmd_string([string]$cmd) {
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    $current = [System.Text.StringBuilder]::new()
+    $inSingle = $false
+    $inDouble = $false
+
+    for ($i = 0; $i -lt $cmd.Length; $i++) {
+        $c = $cmd[$i]
+
+        if ($c -eq "'" -and -not $inDouble) {
+            $inSingle = -not $inSingle
+            continue          # strip the quote character itself
+        }
+        if ($c -eq '"' -and -not $inSingle) {
+            $inDouble = -not $inDouble
+            continue
+        }
+        if ([char]::IsWhiteSpace($c) -and -not $inSingle -and -not $inDouble) {
+            if ($current.Length -gt 0) {
+                $tokens.Add($current.ToString())
+                $current.Clear() | Out-Null
+            }
+            continue
+        }
+        $current.Append($c) | Out-Null
+    }
+    if ($current.Length -gt 0) {
+        $tokens.Add($current.ToString())
+    }
+    return [string[]]$tokens
+}
+
 # Run OCI command with proper authentication handling
 function oci_cmd {
     $cmd = $args -join ' '
-    $result = ''
-    $exit_code = 0
-    $base_args = "--config-file `"$OCI_CONFIG_FILE`" --profile `"$OCI_PROFILE`" --connection-timeout $OCI_CLI_CONNECTION_TIMEOUT --read-timeout $OCI_CLI_READ_TIMEOUT --max-retries $OCI_CLI_MAX_RETRIES"
+    $ociExe = resolve_oci_exe
+
+    # Build argument list as a proper array so we don't need cmd /c
+    $argList = @(
+        '--config-file', $OCI_CONFIG_FILE,
+        '--profile', $OCI_PROFILE,
+        '--connection-timeout', $OCI_CLI_CONNECTION_TIMEOUT,
+        '--read-timeout', $OCI_CLI_READ_TIMEOUT,
+        '--max-retries', $OCI_CLI_MAX_RETRIES
+    )
     if ($env:OCI_CLI_AUTH) {
-        $base_args += " --auth $env:OCI_CLI_AUTH"
+        $argList += '--auth'
+        $argList += $env:OCI_CLI_AUTH
     }
     elseif ($script:auth_method) {
-        $base_args += " --auth $script:auth_method"
+        $argList += '--auth'
+        $argList += $script:auth_method
     }
+    # Append the user-supplied sub-command tokens, respecting quoted arguments
+    $argList += (tokenize_cmd_string $cmd)
 
-    # Run command with proper error handling
-    try {
-        $full_cmd = "oci $base_args $cmd"
-        $result = & cmd /c $full_cmd 2>&1
-        $exit_code = $LASTEXITCODE
-        if ($null -eq $exit_code) { $exit_code = 0 }
-    }
-    catch {
-        $result = $_.Exception.Message
-        $exit_code = 1
-    }
+    # Invoke oci directly, merging stderr into stdout to avoid ErrorActionPreference='Stop'
+    # from turning informational stderr lines into terminating errors.
+    $allOutput = & $ociExe @argList 2>&1
+    $exit_code = $LASTEXITCODE
+    if ($null -eq $exit_code) { $exit_code = 0 }
+
+    # Separate stdout (strings) from stderr (ErrorRecord objects)
+    $stdout = ($allOutput | Where-Object { $_ -is [string] }) -join "`n"
+    $stderr = ($allOutput | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join "`n"
 
     if ($exit_code -eq 0) {
-        return $result
+        return $stdout
     }
     if ($exit_code -eq 124 -or $exit_code -eq -1) {
         print_warning "OCI CLI call timed out after ${OCI_CMD_TIMEOUT}s"
     }
 
-    throw "OCI command failed: $result"
+    throw "OCI command failed (exit $exit_code): $stderr $stdout"
 }
 
-# Safe JSON parsing with jq
+# Safe JSON parsing using PowerShell native parsing (no jq required)
 function safe_jq {
     param([string]$json, [string]$query, [string]$default = '')
     if ([string]::IsNullOrEmpty($json) -or $json -eq 'null') {
         return $default
     }
     try {
-        $result = $json | jq -r $query 2>$null
-        if ($result -eq 'null' -or [string]::IsNullOrEmpty($result)) {
+        # Parse JSON
+        $obj = $json | ConvertFrom-Json -ErrorAction Stop
+        
+        # Parse jq-like query and navigate the object
+        # Supports: .property, ."property-with-dashes", [index], nested paths
+        $result = $obj
+        
+        # Remove leading dot if present
+        $query = $query.TrimStart('.')
+        
+        # Split by dots, but respect quoted strings and brackets
+        $tokens = @()
+        $current = ''
+        $inQuotes = $false
+        $inBrackets = $false
+        
+        for ($i = 0; $i -lt $query.Length; $i++) {
+            $char = $query[$i]
+            
+            if ($char -eq '"') {
+                $inQuotes = -not $inQuotes
+                continue
+            }
+            
+            if ($char -eq '[' -and -not $inQuotes) {
+                if ($current) {
+                    $tokens += $current
+                    $current = ''
+                }
+                $inBrackets = $true
+                $current = '['
+                continue
+            }
+            
+            if ($char -eq ']' -and -not $inQuotes) {
+                $current += ']'
+                $tokens += $current
+                $current = ''
+                $inBrackets = $false
+                continue
+            }
+            
+            if ($char -eq '.' -and -not $inQuotes -and -not $inBrackets) {
+                if ($current) {
+                    $tokens += $current
+                    $current = ''
+                }
+                continue
+            }
+            
+            $current += $char
+        }
+        
+        if ($current) {
+            $tokens += $current
+        }
+        
+        # Navigate through tokens
+        foreach ($token in $tokens) {
+            if ([string]::IsNullOrEmpty($token)) { continue }
+            
+            # Handle array index like [0]
+            if ($token -match '^\[(\d+)\]$') {
+                $index = [int]$matches[1]
+                if ($result -is [array] -and $index -lt $result.Count) {
+                    $result = $result[$index]
+                } else {
+                    return $default
+                }
+            }
+            # Handle property access
+            else {
+                $propName = $token
+                # Handle properties with dashes or special characters
+                if ($result.PSObject.Properties[$propName]) {
+                    $result = $result.$propName
+                } else {
+                    return $default
+                }
+            }
+        }
+        
+        # Convert result to string
+        if ($null -eq $result -or $result -eq 'null') {
             return $default
         }
-        return $result
+        
+        return $result.ToString()
     }
     catch {
         return $default
@@ -401,7 +694,8 @@ function retry_with_backoff {
     while ($attempt -le $RETRY_MAX_ATTEMPTS) {
         print_status "Attempt $attempt/${RETRY_MAX_ATTEMPTS}: $cmd"
         try {
-            $out = & cmd /c $cmd 2>&1
+            # Use Invoke-Expression for cross-platform command execution
+            $out = Invoke-Expression "$cmd 2>&1" -ErrorAction SilentlyContinue
             $rc = $LASTEXITCODE
             if ($null -eq $rc) { $rc = 0 }
         }
@@ -461,7 +755,7 @@ function out_of_capacity_auto_apply {
     while ($attempt -le $RETRY_MAX_ATTEMPTS) {
         print_status "Apply attempt $attempt/$RETRY_MAX_ATTEMPTS"
         try {
-            & terraform apply -input=false tfplan 2>&1 | Tee-Object -Variable out | Out-Null
+            & terraform apply tfplan 2>&1 | Tee-Object -Variable out | Out-Null
             $rc = $LASTEXITCODE
             if ($null -eq $rc) { $rc = 0 }
         }
@@ -583,13 +877,10 @@ terraform {
 # Confirm action with user
 function confirm_action {
     param([string]$prompt, [string]$default = 'N')
-    if ($NON_INTERACTIVE -eq 'true') {
-        return ($default -eq 'Y')
-    }
     $yn_prompt = if ($default -eq 'Y') { '[Y/n]' } else { '[y/N]' }
     $response = Read-Host "$($BLUE)$prompt $yn_prompt`: $($NC)"
-    $response = if ([string]::IsNullOrEmpty($response)) { $default } else { $response }
-    return ($response -match '^[Yy]$')
+    $normalized = normalize_bool_input $(if ([string]::IsNullOrEmpty($response)) { $default } else { $response })
+    return ($normalized -match '^(y|yes)$')
 }
 
 # ============================================================================
@@ -599,32 +890,59 @@ function confirm_action {
 function install_prerequisites {
     print_subheader "Installing Prerequisites"
     
-    $packages_to_install = @()
-    
-    # Check for required commands
-    if (!(command_exists 'jq')) {
-        $packages_to_install += 'jq'
-    }
-    if (!(command_exists 'curl')) {
-        $packages_to_install += 'curl'
-    }
-    if (!(command_exists 'unzip')) {
-        $packages_to_install += 'unzip'
-    }
-    
-    if ($packages_to_install.Count -gt 0) {
-        print_status "Installing required packages: $($packages_to_install -join ', ')"
-        # Assuming Chocolatey or similar, but for simplicity, assume they are installed or skip
-        print_warning "Please install the following packages manually: $($packages_to_install -join ', ')"
-    }
-    
-    # Verify all required commands exist
-    $required_commands = @('jq', 'openssl', 'ssh-keygen', 'curl')
-    foreach ($cmd in $required_commands) {
-        if (!(command_exists $cmd)) {
-            print_error "Required command '$cmd' is not available"
-            throw "Missing command $cmd"
+    # Check for ssh-keygen (required for SSH key generation)
+    if (!(command_exists 'ssh-keygen')) {
+        print_status "ssh-keygen not found. Attempting to install OpenSSH..."
+        
+        # Try to enable OpenSSH client on Windows
+        try {
+            $sshClient = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Client*'
+            if ($sshClient.State -ne 'Installed') {
+                print_status "Installing OpenSSH Client via Windows capabilities..."
+                Add-WindowsCapability -Online -Name $sshClient.Name -ErrorAction Stop | Out-Null
+                print_success "OpenSSH Client installed successfully"
+            }
         }
+        catch {
+            print_warning "Could not install OpenSSH via Windows capabilities: $_"
+            
+            # Try chocolatey as fallback
+            if (command_exists 'choco') {
+                print_status "Attempting to install openssh via Chocolatey..."
+                try {
+                    & choco install openssh --yes --no-progress 2>&1 | Out-Null
+                    print_success "OpenSSH installed via Chocolatey"
+                }
+                catch {
+                    print_error "Failed to install OpenSSH. Please install manually:"
+                    print_error "  Option 1: Run as Administrator: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0"
+                    print_error "  Option 2: Install via Chocolatey: choco install openssh"
+                    print_error "  Option 3: Download from: https://github.com/PowerShell/Win32-OpenSSH/releases"
+                    throw "Missing required command: ssh-keygen"
+                }
+            }
+            else {
+                print_error "ssh-keygen is required but not found. Please install OpenSSH:"
+                print_error "  Option 1: Run as Administrator: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0"
+                print_error "  Option 2: Install via Chocolatey: choco install openssh"
+                print_error "  Option 3: Download from: https://github.com/PowerShell/Win32-OpenSSH/releases"
+                throw "Missing required command: ssh-keygen"
+            }
+        }
+        
+        # Verify installation
+        if (!(command_exists 'ssh-keygen')) {
+            print_error "ssh-keygen still not available after installation attempt"
+            throw "Missing required command: ssh-keygen"
+        }
+    }
+    else {
+        print_status "ssh-keygen is available"
+    }
+    
+    # Check for unzip (used by Terraform installation)
+    if (!(command_exists 'unzip')) {
+        print_status "unzip not found, but PowerShell Expand-Archive can be used as fallback"
     }
     
     print_success "All prerequisites installed"
@@ -640,38 +958,89 @@ function install_oci_cli {
         return
     }
     
+    # Also check inside the venv directly (venv might not be activated yet)
+    $venvBin = if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) { 'Scripts' } else { 'bin' }
+    $venvOciExe = Join-Path $PWD '.venv' $venvBin 'oci'
+    if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
+        $venvOciExe = Join-Path $PWD '.venv' $venvBin 'oci.exe'
+    }
+    if (Test-Path $venvOciExe) {
+        $version = try { & $venvOciExe --version 2>$null | Select-Object -First 1 } catch { 'unknown' }
+        print_status "OCI CLI found in venv: $version"
+        return
+    }
+    
     print_status "Installing OCI CLI..."
     
-    # Check if Python is installed
-    if (!(command_exists 'python3')) {
-        print_status "Installing Python 3..."
-        # Assume Python is installed, or use winget/choco
-        print_warning "Please install Python 3 manually"
+    # Determine Python command: prefer 'python' on Windows, 'python3' on Unix
+    $pythonCmd = $null
+    if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
+        # On Windows, 'python3' is often a MS Store stub — prefer 'python'
+        foreach ($candidate in @('python', 'python3')) {
+            $found = Get-Command $candidate -ErrorAction SilentlyContinue
+            if ($found -and $found.Source -notmatch 'WindowsApps') {
+                $pythonCmd = $candidate
+                break
+            }
+        }
+    }
+    else {
+        foreach ($candidate in @('python3', 'python')) {
+            if (command_exists $candidate) {
+                $pythonCmd = $candidate
+                break
+            }
+        }
+    }
+    if (-not $pythonCmd) {
+        print_error "Python is required but not found. Please install Python 3."
+        throw "Python not found"
     }
     
     # Create virtual environment for OCI CLI
     $venv_dir = '.venv'
     if (!(Test-Path $venv_dir)) {
         print_status "Creating Python virtual environment..."
-        & python3 -m venv $venv_dir
+        & $pythonCmd -m venv $venv_dir
+    }
+    elseif (!(Test-Path (Join-Path $venv_dir 'pyvenv.cfg'))) {
+        # Venv directory exists but is corrupted (missing pyvenv.cfg), recreate it
+        print_warning "Virtual environment appears corrupted (missing pyvenv.cfg). Recreating..."
+        Remove-Item $venv_dir -Recurse -Force
+        & $pythonCmd -m venv $venv_dir
     }
     
-    # Activate and install OCI CLI
-    # In PowerShell, activate venv
-    & "$venv_dir\Scripts\Activate.ps1"
+    # Activate virtual environment (cross-platform)
+    $activateScript = Join-Path $PWD $venv_dir $venvBin 'Activate.ps1'
+    if (Test-Path $activateScript) {
+        & $activateScript
+    }
+    else {
+        print_error "Could not find activation script at $activateScript"
+        throw "Venv activation failed"
+    }
+    
+    # After activation, use the venv's own python to ensure correct pip context
+    $venvPython = Join-Path $PWD $venv_dir $venvBin 'python'
+    if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) {
+        $venvPython = Join-Path $PWD $venv_dir $venvBin 'python.exe'
+    }
     
     print_status "Installing OCI CLI in virtual environment..."
-    & pip install --upgrade pip --quiet
-    & pip install oci-cli --quiet
+    & $venvPython -m pip install --upgrade pip --quiet 2>&1 | Out-Null
+    & $venvPython -m pip install oci-cli --quiet
     
-    # Add activation to profile if not already present
-    $activation_line = "& '$PWD\$venv_dir\Scripts\Activate.ps1'"
-    $profileContent = Get-Content $PROFILE -Raw -ErrorAction SilentlyContinue
-    if ($profileContent -notmatch [regex]::Escape($activation_line)) {
-        Add-Content $PROFILE "`n# OCI CLI virtual environment`n$activation_line"
+    # Verify installation
+    if (Test-Path $venvOciExe) {
+        print_success "OCI CLI installed successfully"
     }
-    
-    print_success "OCI CLI installed successfully"
+    elseif (command_exists 'oci') {
+        print_success "OCI CLI installed successfully"
+    }
+    else {
+        print_error "OCI CLI installation completed but 'oci' executable not found"
+        throw "OCI CLI installation failed"
+    }
 }
 
 function install_terraform {
@@ -757,10 +1126,292 @@ function detect_auth_method {
     print_debug "Detected auth method: $script:auth_method (profile: $OCI_PROFILE, config: $OCI_CONFIG_FILE)"
 }
 
+function ensure_oci_config_bootstrap {
+    param(
+        [string]$ConfigPath,
+        [string]$ProfileName,
+        [string]$RegionHint
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        throw "OCI config path is empty"
+    }
+
+    $effectiveProfile = if ([string]::IsNullOrWhiteSpace($ProfileName)) { 'DEFAULT' } else { $ProfileName }
+    $effectiveRegion = if ([string]::IsNullOrWhiteSpace($RegionHint)) { default_region_for_host } else { $RegionHint }
+    $configDir = Split-Path -Parent $ConfigPath
+
+    if (-not (Test-Path $configDir)) {
+        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    }
+
+    if (-not (Test-Path $ConfigPath)) {
+        print_warning "OCI config file missing at $ConfigPath. Creating bootstrap profile [$effectiveProfile]."
+        $bootstrapContent = @"
+[$effectiveProfile]
+region=$effectiveRegion
+"@
+        Set-Content -Path $ConfigPath -Value $bootstrapContent
+        print_debug "Bootstrapped OCI config at $ConfigPath"
+        return
+    }
+
+    $content = Get-Content $ConfigPath -Raw
+    if ($content -notmatch "(?m)^\[$([regex]::Escape($effectiveProfile))\]\s*$") {
+        print_warning "OCI profile [$effectiveProfile] not present in $ConfigPath. Appending bootstrap profile section."
+        Add-Content -Path $ConfigPath -Value "`n[$effectiveProfile]`nregion=$effectiveRegion`n"
+    }
+}
+
+function normalize_auth_region {
+    param([string]$regionInput)
+
+    $candidate = if ($null -eq $regionInput) { '' } else { $regionInput.Trim() }
+    if ($candidate -eq ':' -or [string]::IsNullOrWhiteSpace($candidate)) {
+        return (default_region_for_host)
+    }
+
+    if ($candidate -match '^[a-z]{2}-[a-z0-9-]+-\d+$') {
+        return $candidate
+    }
+
+    print_warning "Invalid region input '$candidate'. Falling back to default region."
+    return (default_region_for_host)
+}
+
+# ── Cross-platform OCI session authenticate helper ──
+# Uses --no-browser universally so stderr informational output never triggers
+# PowerShell's ErrorActionPreference='Stop' terminating-error behavior.
+# Extracts the login URL from the CLI output, opens the browser ourselves,
+# then waits for the user to complete login (the CLI blocks until done).
+#
+# Parameters:
+#   -ProfileName  : OCI profile name
+#   -Region       : OCI region string
+#   -ReturnOutput : (switch) If set, returns a hashtable {Stdout, Stderr, ExitCode}
+#                   instead of throwing on failure. Useful for callers that need to
+#                   inspect the output for config-error detection.
+function invoke_oci_session_authenticate {
+    param(
+        [string]$ProfileName,
+        [string]$Region,
+        [switch]$ReturnOutput
+    )
+
+    $ociExe = resolve_oci_exe
+
+    # Build argument list
+    $argList = @(
+        '--config-file', $script:OCI_CONFIG_FILE,
+        'session', 'authenticate',
+        '--no-browser',
+        '--profile-name', $ProfileName,
+        '--region', $Region,
+        '--session-expiration-in-minutes', '60'
+    )
+
+    print_status "Launching OCI session authentication (--no-browser mode)..."
+    print_status "The CLI will print a URL. Please open it in your browser to log in."
+    Write-Host ""
+
+    # Strategy: launch the process with redirected stdout/stderr, then poll both
+    # streams from the MAIN thread using ReadLineAsync(). This avoids the broken
+    # Register-ObjectEvent approach where event-handler scriptblocks run in a
+    # separate runspace and cannot call Write-Host / Start-Process reliably.
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $ociExe
+    # Use ArgumentList (collection) for proper quoting on all platforms (.NET 5+)
+    foreach ($a in $argList) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+
+    $proc = [System.Diagnostics.Process]::new()
+    $proc.StartInfo = $psi
+
+    $stdoutLines = [System.Collections.Generic.List[string]]::new()
+    $stderrLines = [System.Collections.Generic.List[string]]::new()
+    $browserOpened = $false
+
+    try {
+        $proc.Start() | Out-Null
+
+        $stdoutReader = $proc.StandardOutput
+        $stderrReader = $proc.StandardError
+
+        # Kick off the first async reads
+        $stdoutTask = $stdoutReader.ReadLineAsync()
+        $stderrTask = $stderrReader.ReadLineAsync()
+        $stdoutDone = $false
+        $stderrDone = $false
+
+        # Poll both streams from the main thread
+        while (-not ($stdoutDone -and $stderrDone)) {
+            # --- stdout ---
+            if (-not $stdoutDone -and $stdoutTask.IsCompleted) {
+                $line = $stdoutTask.Result
+                if ($null -eq $line) {
+                    $stdoutDone = $true
+                }
+                else {
+                    $stdoutLines.Add($line)
+                    Write-Host $line
+                    if (-not $browserOpened -and $line -match '(https://[^\s]+)') {
+                        open_url_best_effort $Matches[1]
+                        $browserOpened = $true
+                    }
+                    $stdoutTask = $stdoutReader.ReadLineAsync()
+                }
+            }
+
+            # --- stderr ---
+            if (-not $stderrDone -and $stderrTask.IsCompleted) {
+                $line = $stderrTask.Result
+                if ($null -eq $line) {
+                    $stderrDone = $true
+                }
+                else {
+                    $stderrLines.Add($line)
+                    Write-Host $line
+                    if (-not $browserOpened -and $line -match '(https://[^\s]+)') {
+                        open_url_best_effort $Matches[1]
+                        $browserOpened = $true
+                    }
+                    $stderrTask = $stderrReader.ReadLineAsync()
+                }
+            }
+
+            if (-not ($stdoutDone -and $stderrDone)) {
+                Start-Sleep -Milliseconds 150
+            }
+        }
+
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+    }
+    finally {
+        $proc.Dispose()
+    }
+
+    $stdoutStr = $stdoutLines -join "`n"
+    $stderrStr = $stderrLines -join "`n"
+
+    if ($ReturnOutput) {
+        return @{
+            Stdout   = $stdoutStr
+            Stderr   = $stderrStr
+            ExitCode = $exitCode
+        }
+    }
+
+    if ($exitCode -ne 0) {
+        print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+        print_error "Exit code: $exitCode"
+        if ($stderrStr) { print_error "Details: $stderrStr" }
+        throw "Authentication failed"
+    }
+
+    print_success "Browser authentication completed successfully"
+}
+
+function invoke_oci_setup_bootstrap {
+    param(
+        [string]$ProfileName,
+        [string]$ConfigPath,
+        [string]$Region,
+        [switch]$ReturnOutput
+    )
+
+    $ociExe = resolve_oci_exe
+    if ([string]::IsNullOrWhiteSpace($Region)) {
+        $Region = default_region_for_host
+    }
+
+    $argList = @(
+        '--region', $Region,
+        'setup', 'bootstrap',
+        '--profile-name', $ProfileName,
+        '--config-location', $ConfigPath
+    )
+
+    print_status "Launching OCI setup bootstrap (automated, browser-login only)..."
+    print_status "Region: $Region"
+    print_status "Private key passphrase: none (auto-set N/A)"
+    print_status "A browser window will open for Oracle Cloud login."
+    Write-Host ""
+
+    $stdoutStr = ''
+    $stderrStr = ''
+    $exitCode = 1
+    $proc = $null
+
+    try {
+        # Redirect ONLY stdin so we can pre-fill region + passphrase answers.
+        # stdout/stderr go directly to the console so the user sees progress
+        # and the OCI CLI can open the browser itself.
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $ociExe
+        foreach ($a in $argList) { $psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $false
+        $psi.RedirectStandardError  = $false
+
+        $proc = [System.Diagnostics.Process]::new()
+        $proc.StartInfo = $psi
+        $proc.Start() | Out-Null
+
+        # Pre-fill expected interactive prompts via stdin so no manual typing
+        # is needed (except browser authentication itself). We include many
+        # passphrase entries because OCI may re-prompt for confirmation.
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.WriteLine('N/A')
+        $proc.StandardInput.Close()
+
+        $proc.WaitForExit()
+        $exitCode = $proc.ExitCode
+        if ($null -eq $exitCode) { $exitCode = 0 }
+    }
+    catch {
+        $stderrStr = $_.Exception.Message
+        $exitCode = 1
+    }
+    finally {
+        if ($proc) { $proc.Dispose() }
+    }
+
+    if ($ReturnOutput) {
+        return @{
+            Stdout   = $stdoutStr
+            Stderr   = $stderrStr
+            ExitCode = $exitCode
+        }
+    }
+
+    if ($exitCode -ne 0) {
+        print_error "OCI setup bootstrap failed"
+        print_error "Exit code: $exitCode"
+        if ($stderrStr) { print_error "Details: $stderrStr" }
+        throw "Bootstrap authentication failed"
+    }
+
+    print_success "OCI setup bootstrap completed successfully"
+}
+
 function setup_oci_config {
     print_subheader "OCI Authentication"
     
-    New-Item -ItemType Directory -Path "$env:USERPROFILE\.oci" -Force | Out-Null
+    # Cross-platform home directory for .oci config
+    $ociDir = if ($env:USERPROFILE) { "$env:USERPROFILE\.oci" } else { "$env:HOME/.oci" }
+    New-Item -ItemType Directory -Path $ociDir -Force | Out-Null
     
     $existing_config_invalid = $false
     if (Test-Path $OCI_CONFIG_FILE) {
@@ -776,7 +1427,7 @@ function setup_oci_config {
         else {
             # Test existing configuration
             print_status "Testing existing OCI configuration connectivity..."
-            if (test_oci_connectivity) {
+            if (wait_for_oci_connectivity) {
                 print_success "Existing OCI configuration is valid"
                 return
             }
@@ -787,126 +1438,64 @@ function setup_oci_config {
     print_status "Setting up browser-based authentication..."
     print_status "This will open a browser window for you to log in to Oracle Cloud."
 
-    if ($NON_INTERACTIVE -eq 'true') {
-        print_error "Cannot perform interactive authentication in non-interactive mode. Aborting."
-        throw "Non-interactive auth not possible"
-    }
-
-    # Determine region to use for browser login.
-    # If we have an existing config, prefer its region (avoids the region selection prompt).
+    # Determine region to use for browser login (auto-detected, no prompt).
     $auth_region = read_oci_config_value 'region' $OCI_CONFIG_FILE $OCI_PROFILE
     $auth_region = if ($auth_region) { $auth_region } else { $OCI_AUTH_REGION }
     $auth_region = if ($auth_region) { $auth_region } else { default_region_for_host }
+    $auth_region = normalize_auth_region $auth_region
+    print_status "Using region: $auth_region"
 
-    # Keep this interactive (per UX request): prompt with a sane default so Enter works.
-    if ($NON_INTERACTIVE -ne 'true') {
-        $auth_region = prompt_with_default "Region for authentication" $auth_region
+    $env:OCI_CLI_CONFIG_FILE = $OCI_CONFIG_FILE
+
+    # --- Helper: delete corrupted config and prepare for fresh auth ---
+    $delete_and_prepare_fresh_config = {
+        param([string]$reason)
+        print_warning "$reason - AUTOMATICALLY DELETING AND FORCING FRESH AUTHENTICATION"
+        if (Test-Path $OCI_CONFIG_FILE) {
+            print_status "Backing up corrupted config to $OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
+            Copy-Item $OCI_CONFIG_FILE "$OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))" -ErrorAction SilentlyContinue
+            print_status "Forcibly deleting corrupted config file: $OCI_CONFIG_FILE"
+            Remove-Item $OCI_CONFIG_FILE -Force
+        }
+        $sessionAuthFile = Join-Path $ociDir 'config.session_auth'
+        Remove-Item $sessionAuthFile -ErrorAction SilentlyContinue
+        $script:OCI_CONFIG_FILE = Join-Path $ociDir 'config'
+        $script:OCI_PROFILE = 'DEFAULT'
+        $env:OCI_CLI_CONFIG_FILE = $null
     }
 
     # Allow forcing re-auth / new profile
     if ($FORCE_REAUTH -eq 'true') {
-        $new_profile = prompt_with_default "Enter new profile name to create/use" "NEW_PROFILE"
-        print_status "Starting interactive session authenticate for profile '$new_profile'..."
-
+        $new_profile = 'DEFAULT'
+        print_status "Starting authentication setup for profile '$new_profile'..."
         print_status "Using region '$auth_region' for authentication"
-        try {
-            if (is_wsl) {
-                $auth_out = & oci session authenticate --no-browser --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60 2>&1
-                Write-Host $auth_out
-                $url = $auth_out | Select-String -Pattern 'https://[^ ]+' | ForEach-Object { $_.Matches.Value } | Select-Object -First 1
-                if ($url) {
-                    print_status "Opening browser for login URL (WSL)..."
-                    open_url_best_effort $url | Out-Null
-                }
-            }
-            else {
-                & oci session authenticate --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60
-            }
-        }
-        catch {
-            print_error "Authentication failed"
-            throw "Authentication failed"
-        }
+
+        invoke_oci_setup_bootstrap -ProfileName $new_profile -ConfigPath $OCI_CONFIG_FILE -Region $auth_region
+        detect_auth_method
 
         print_status "Authentication for profile '$new_profile' completed. Updating OCI_PROFILE to use it."
         $script:OCI_PROFILE = $new_profile
-        $script:auth_method = 'security_token'
 
         if ($existing_config_invalid) {
-            # Run the same automatic delete and recreate flow
-            print_warning "Detected invalid or incomplete OCI config file during forced re-auth - AUTOMATICALLY DELETING AND FORCING FRESH AUTHENTICATION"
-
-            # IMMEDIATE DELETE: Remove corrupted config without prompting
-            if (Test-Path $OCI_CONFIG_FILE) {
-                print_status "Backing up corrupted config to $OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
-                Copy-Item $OCI_CONFIG_FILE "$OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))" -ErrorAction SilentlyContinue
-                print_status "Forcibly deleting corrupted config file: $OCI_CONFIG_FILE"
-                Remove-Item $OCI_CONFIG_FILE -Force
-            }
-            
-            # Delete any temp config files to start completely fresh
-            Remove-Item "$env:USERPROFILE\.oci\config.session_auth" -ErrorAction SilentlyContinue
-            
-            # Create completely new profile with session auth
+            & $delete_and_prepare_fresh_config "Detected invalid or incomplete OCI config file during forced re-auth"
             $new_profile = 'DEFAULT'
             print_status "Creating fresh OCI configuration with browser-based authentication for profile '$new_profile'..."
-            print_status "This will open your browser to log into Oracle Cloud."
             Write-Host ""
             print_status "Using region '$auth_region' for authentication"
             Write-Host ""
-            
-            # Use the default config location (let OCI CLI create it fresh)
-            $script:OCI_CONFIG_FILE = "$env:USERPROFILE\.oci\config"
-            $script:OCI_PROFILE = $new_profile
-            $env:OCI_CLI_CONFIG_FILE = $null
-            
-            if (is_wsl) {
-                try {
-                    $auth_out = & oci session authenticate --no-browser --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60 2>&1
-                    Write-Host $auth_out
-                    $url = $auth_out | Select-String -Pattern 'https://[^ ]+' | ForEach-Object { $_.Matches.Value } | Select-Object -First 1
-                    if ($url) {
-                        print_status "Opening browser for login URL (WSL)..."
-                        open_url_best_effort $url | Out-Null
-                        Write-Host ""
-                        print_status "After completing browser authentication, press Enter to continue..."
-                        Read-Host
-                    }
-                    $script:auth_method = 'security_token'
-                    if (test_oci_connectivity) {
-                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
-                        return
-                    }
-                    else {
-                        print_warning "Session auth completed but connectivity test failed"
-                    }
-                }
-                catch {
-                    Write-Host $_.Exception.Message
-                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
-                    throw "Authentication failed"
-                }
+
+            invoke_oci_setup_bootstrap -ProfileName $new_profile -ConfigPath $script:OCI_CONFIG_FILE -Region $auth_region
+            detect_auth_method
+            if (wait_for_oci_connectivity) {
+                print_success "Fresh session authentication succeeded for profile '$new_profile'"
+                return
             }
             else {
-                try {
-                    & oci session authenticate --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60
-                    $script:auth_method = 'security_token'
-                    if (test_oci_connectivity) {
-                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
-                        return
-                    }
-                    else {
-                        print_warning "Session auth completed but connectivity test failed"
-                    }
-                }
-                catch {
-                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
-                    throw "Authentication failed"
-                }
+                print_warning "Session auth completed but connectivity test failed"
             }
         }
 
-        if (test_oci_connectivity) {
+        if (wait_for_oci_connectivity) {
             print_success "OCI authentication configured successfully for profile '$new_profile'"
             return
         }
@@ -915,204 +1504,64 @@ function setup_oci_config {
         }
     }
     else {
-        # If existing config was invalid, automatically fix it
-        if ($existing_config_invalid) {
-            print_warning "Detected invalid or incomplete OCI config file - AUTOMATICALLY DELETING AND FORCING FRESH AUTHENTICATION"
-            
-            # IMMEDIATE DELETE: Remove corrupted config without prompting
-            if (Test-Path $OCI_CONFIG_FILE) {
-                print_status "Backing up corrupted config to $OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
-                Copy-Item $OCI_CONFIG_FILE "$OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))" -ErrorAction SilentlyContinue
-                print_status "Forcibly deleting corrupted config file: $OCI_CONFIG_FILE"
-                Remove-Item $OCI_CONFIG_FILE -Force
+        # If existing config is missing/invalid, go straight to bootstrap.
+        if ($existing_config_invalid -or -not (Test-Path $OCI_CONFIG_FILE)) {
+            if ($existing_config_invalid) {
+                & $delete_and_prepare_fresh_config "Detected invalid or incomplete OCI config file"
             }
-            
-            # Delete any temp config files to start completely fresh
-            Remove-Item "$env:USERPROFILE\.oci\config.session_auth" -ErrorAction SilentlyContinue
-            
-            # Create completely new profile with session auth
             $new_profile = 'DEFAULT'
             print_status "Creating fresh OCI configuration with browser-based authentication for profile '$new_profile'..."
             print_status "This will open your browser to log into Oracle Cloud."
             Write-Host ""
-            print_status "Using region '$auth_region' for authentication"
-            Write-Host ""
-            
-            # Use the default config location (let OCI CLI create it fresh)
-            $script:OCI_CONFIG_FILE = "$env:USERPROFILE\.oci\config"
-            $script:OCI_PROFILE = $new_profile
-            $env:OCI_CLI_CONFIG_FILE = $null
-            
-            if (is_wsl) {
-                try {
-                    $auth_out = & oci session authenticate --no-browser --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60 2>&1
-                    Write-Host $auth_out
-                    $url = $auth_out | Select-String -Pattern 'https://[^ ]+' | ForEach-Object { $_.Matches.Value } | Select-Object -First 1
-                    if ($url) {
-                        print_status "Opening browser for login URL (WSL)..."
-                        open_url_best_effort $url | Out-Null
-                        Write-Host ""
-                        print_status "After completing browser authentication, press Enter to continue..."
-                        Read-Host
-                    }
-                    $script:auth_method = 'security_token'
-                    if (test_oci_connectivity) {
-                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
-                        return
-                    }
-                    else {
-                        print_warning "Session auth completed but connectivity test failed"
-                    }
-                }
-                catch {
-                    Write-Host $_.Exception.Message
-                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
-                    throw "Authentication failed"
-                }
+            invoke_oci_setup_bootstrap -ProfileName $new_profile -ConfigPath $script:OCI_CONFIG_FILE -Region $auth_region
+            detect_auth_method
+            if (wait_for_oci_connectivity) {
+                print_success "Fresh authentication succeeded for profile '$new_profile'"
+                return
             }
-            else {
-                try {
-                    & oci session authenticate --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60
-                    $script:auth_method = 'security_token'
-                    if (test_oci_connectivity) {
-                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
-                        return
-                    }
-                    else {
-                        print_warning "Session auth completed but connectivity test failed"
-                    }
-                }
-                catch {
-                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
-                    throw "Authentication failed"
-                }
-            }
+            print_warning "Authentication completed but connectivity test failed"
+            throw "Authentication failed"
         }
+
         # Interactive authenticate (may open browser)
         print_status "Using profile '$script:OCI_PROFILE' for interactive session authenticate..."
-
         print_status "Using region '$auth_region' for authentication"
-        if (is_wsl) {
-            try {
-                $auth_out = & oci session authenticate --no-browser --profile-name $script:OCI_PROFILE --region $auth_region --session-expiration-in-minutes 60 2>&1
-                Write-Host $auth_out
-                $url = $auth_out | Select-String -Pattern 'https://[^ ]+' | ForEach-Object { $_.Matches.Value } | Select-Object -First 1
-                if ($url) {
-                    print_status "Opening browser for login URL (WSL)..."
-                    open_url_best_effort $url | Out-Null
-                }
-            }
-            catch {
-                Write-Host $_.Exception.Message
-                if ($auth_out -match '(?i)config file.*is invalid|Config Errors|user .*missing') {
-                    print_warning "OCI CLI reports the config file is invalid or missing required fields. Offering repair options..."
-                    $existing_config_invalid = $true
-                }
-                else {
-                    print_error "Authentication failed"
-                    throw "Authentication failed"
-                }
-            }
-        }
-        else {
-            # Capture output so we can detect invalid-config errors and offer remediation
-            try {
-                & oci session authenticate --profile-name $script:OCI_PROFILE --region $auth_region --session-expiration-in-minutes 60
-            }
-            catch {
-                $auth_out = $_.Exception.Message
-                if ($auth_out -match '(?i)config file.*is invalid|Config Errors|user .*missing') {
-                    print_warning "OCI CLI reports the config file is invalid or missing required fields. Offering repair options..."
-                    $existing_config_invalid = $true
-                }
-                else {
-                    print_error "Browser authentication failed or was cancelled"
-                    throw "Authentication failed"
-                }
-            }
-        }
+        ensure_oci_config_bootstrap -ConfigPath $OCI_CONFIG_FILE -ProfileName $script:OCI_PROFILE -RegionHint $auth_region
 
-        # SHARED REPAIR FLOW: runs for both WSL and non-WSL when existing_config_invalid is set
-        if ($existing_config_invalid) {
-            print_warning "Detected invalid or incomplete OCI config file - AUTOMATICALLY DELETING AND FORCING FRESH AUTHENTICATION"
-            
-            # IMMEDIATE DELETE: Remove corrupted config without prompting
-            if (Test-Path $OCI_CONFIG_FILE) {
-                print_status "Backing up corrupted config to $OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))"
-                Copy-Item $OCI_CONFIG_FILE "$OCI_CONFIG_FILE.corrupted.$((Get-Date).ToString('yyyyMMdd_HHmmss'))" -ErrorAction SilentlyContinue
-                print_status "Forcibly deleting corrupted config file: $OCI_CONFIG_FILE"
-                Remove-Item $OCI_CONFIG_FILE -Force
-            }
-            
-            # Delete any temp config files to start completely fresh
-            Remove-Item "$env:USERPROFILE\.oci\config.session_auth" -ErrorAction SilentlyContinue
-            
-            # Create completely new profile with session auth
-            $new_profile = 'DEFAULT'
-            print_status "Creating fresh OCI configuration with browser-based authentication for profile '$new_profile'..."
-            print_status "This will open your browser to log into Oracle Cloud."
-            Write-Host ""
-            print_status "Using region '$auth_region' for authentication"
-            Write-Host ""
-            
-            # Use the default config location (let OCI CLI create it fresh)
-            $script:OCI_CONFIG_FILE = "$env:USERPROFILE\.oci\config"
-            $script:OCI_PROFILE = $new_profile
-            $env:OCI_CLI_CONFIG_FILE = $null
-            
-            if (is_wsl) {
-                try {
-                    $auth_out = & oci session authenticate --no-browser --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60 2>&1
-                    Write-Host $auth_out
-                    $url = $auth_out | Select-String -Pattern 'https://[^ ]+' | ForEach-Object { $_.Matches.Value } | Select-Object -First 1
-                    if ($url) {
-                        print_status "Opening browser for login URL (WSL)..."
-                        open_url_best_effort $url | Out-Null
-                        Write-Host ""
-                        print_status "After completing browser authentication, press Enter to continue..."
-                        Read-Host
-                    }
-                    $script:auth_method = 'security_token'
-                    if (test_oci_connectivity) {
-                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
-                        return
-                    }
-                    else {
-                        print_warning "Session auth completed but connectivity test failed"
-                    }
+        $authResult = invoke_oci_session_authenticate -ProfileName $script:OCI_PROFILE -Region $auth_region -ReturnOutput
+
+        # Check if the auth output indicates an invalid config (so we can offer repair)
+        if ($authResult.ExitCode -ne 0) {
+            $combinedOut = "$($authResult.Stdout)`n$($authResult.Stderr)"
+            if ($combinedOut -match '(?i)config file.*is invalid|Config Errors|user .*missing') {
+                print_warning "OCI CLI reports the profile requires full API-key fields. Falling back to setup bootstrap flow..."
+                & $delete_and_prepare_fresh_config "Detected invalid or incomplete OCI config file"
+                $bootstrapResult = invoke_oci_setup_bootstrap -ProfileName $script:OCI_PROFILE -ConfigPath $OCI_CONFIG_FILE -Region $auth_region -ReturnOutput
+                if ($bootstrapResult.ExitCode -ne 0) {
+                    print_error "Bootstrap fallback failed"
+                    throw "Authentication failed"
                 }
-                catch {
-                    Write-Host $_.Exception.Message
-                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
+
+                detect_auth_method
+                if (wait_for_oci_connectivity) {
+                    print_success "OCI authentication configured successfully via bootstrap"
+                    return
+                }
+                else {
+                    print_warning "Bootstrap completed but connectivity test failed"
                     throw "Authentication failed"
                 }
             }
             else {
-                try {
-                    & oci session authenticate --profile-name $new_profile --region $auth_region --session-expiration-in-minutes 60
-                    $script:auth_method = 'security_token'
-                    if (test_oci_connectivity) {
-                        print_success "Fresh session authentication succeeded for profile '$new_profile'"
-                        return
-                    }
-                    else {
-                        print_warning "Session auth completed but connectivity test failed"
-                    }
-                }
-                catch {
-                    print_error "Browser-based authentication failed. Please verify your Oracle Cloud credentials and try again."
-                    throw "Authentication failed"
-                }
+                print_error "Browser authentication failed or was cancelled"
+                throw "Authentication failed"
             }
         }
 
-
         # If we got here without returning, then authentication succeeded but connectivity might have issues
-        # Let's continue anyway since the auth was successful
         $script:auth_method = 'security_token'
 
-        # Verify the new configuration
-        if (test_oci_connectivity) {
+        if (wait_for_oci_connectivity) {
             print_success "OCI authentication configured successfully"
             return
         }
@@ -1162,28 +1611,44 @@ function test_oci_connectivity {
     return $false
 }
 
+function wait_for_oci_connectivity {
+    param(
+        [int]$MaxAttempts = 12,
+        [int]$DelaySeconds = 10
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        print_status "Connectivity verification attempt $attempt/$MaxAttempts..."
+        if (test_oci_connectivity) {
+            return $true
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            print_warning "OCI credentials not active yet; retrying in ${DelaySeconds}s..."
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    return $false
+}
+
 # ============================================================================
 # OCI RESOURCE DISCOVERY FUNCTIONS
 # ============================================================================
 
 function fetch_oci_config_values {
     print_subheader "Fetching OCI Configuration"
-    
-    # Tenancy OCID
-    $content = Get-Content $OCI_CONFIG_FILE -Raw
-    if ($content -match 'tenancy=(.*)$') {
-        $script:tenancy_ocid = $matches[1]
-    }
+
+    # Read values from active profile using robust parser
+    $script:tenancy_ocid = read_oci_config_value 'tenancy' $OCI_CONFIG_FILE $OCI_PROFILE
     if ([string]::IsNullOrEmpty($script:tenancy_ocid)) {
         print_error "Failed to fetch tenancy OCID from config"
         throw "Failed to fetch tenancy OCID"
     }
     print_status "Tenancy OCID: $script:tenancy_ocid"
-    
+
     # User OCID
-    if ($content -match '^\s*user\s*=\s*(.*)$') {
-        $script:user_ocid = ($matches[1] -replace '^\s+', '' -replace '\s+$', '')
-    }
+    $script:user_ocid = read_oci_config_value 'user' $OCI_CONFIG_FILE $OCI_PROFILE
     if ([string]::IsNullOrEmpty($script:user_ocid)) {
         # Try to get from API for session token auth
         try {
@@ -1194,25 +1659,22 @@ function fetch_oci_config_values {
         }
     }
     print_status "User OCID: $(if ($script:user_ocid) { $script:user_ocid } else { 'N/A (session token auth)' })"
-    
+
     # Region
-    if ($content -match 'region=(.*)$') {
-        $script:region = $matches[1]
-    }
+    $script:region = read_oci_config_value 'region' $OCI_CONFIG_FILE $OCI_PROFILE
     if ([string]::IsNullOrEmpty($script:region)) {
-        print_error "Failed to fetch region from config"
-        throw "Failed to fetch region"
+        $script:region = default_region_for_host
+        print_warning "Region not found in profile. Falling back to '$script:region'."
     }
+    $script:region = normalize_auth_region $script:region
     print_status "Region: $script:region"
-    
+
     # Fingerprint (only for API key auth)
     if ($script:auth_method -eq 'security_token') {
         $script:fingerprint = 'session_token_auth'
     }
     else {
-        if ($content -match 'fingerprint=(.*)$') {
-            $script:fingerprint = $matches[1]
-        }
+        $script:fingerprint = read_oci_config_value 'fingerprint' $OCI_CONFIG_FILE $OCI_PROFILE
     }
     print_debug "Auth fingerprint: $script:fingerprint"
     
@@ -1235,13 +1697,25 @@ function fetch_availability_domains {
         throw "Failed to fetch ADs"
     }
     
-    # Parse first AD (should come as raw output with newlines)
+    # Parse first AD from either JSON array output or raw newline output.
     try {
-        $ad_array = $ad_list -split '\r?\n' | Where-Object { ![string]::IsNullOrWhiteSpace($_) }
-        $script:availability_domain = $ad_array[0]
+        $trimmedAdList = $ad_list.Trim()
+        if ($trimmedAdList.StartsWith('[')) {
+            $parsedAds = $trimmedAdList | ConvertFrom-Json -ErrorAction Stop
+            if ($parsedAds -is [array] -and $parsedAds.Count -gt 0) {
+                $script:availability_domain = "$($parsedAds[0])".Trim()
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($script:availability_domain)) {
+            $ad_array = $ad_list -split '\r?\n' | ForEach-Object { $_.Trim().Trim('"') } | Where-Object { ![string]::IsNullOrWhiteSpace($_) -and $_ -notin @('[', ']') }
+            if ($ad_array.Count -gt 0) {
+                $script:availability_domain = $ad_array[0]
+            }
+        }
     }
     catch {
-        $script:availability_domain = $ad_list
+        $script:availability_domain = $ad_list.Trim()
     }
     
     if ([string]::IsNullOrEmpty($script:availability_domain) -or $script:availability_domain -eq 'null') {
@@ -1258,14 +1732,14 @@ function fetch_ubuntu_images {
     # Fetch x86 (AMD64) Ubuntu image
     print_status "  Looking for x86 Ubuntu image..."
     try {
-        $x86_images = oci_cmd "compute image list --compartment-id $script:tenancy_ocid --operating-system 'Canonical Ubuntu' --shape '$FREE_TIER_AMD_SHAPE' --sort-by TIMECREATED --sort-order DESC --query 'data[].{id:id,name:\"display-name\"}' --all"
+        $x86_images = oci_cmd "compute image list --compartment-id $script:tenancy_ocid --operating-system 'Canonical Ubuntu' --shape '$FREE_TIER_AMD_SHAPE' --sort-by TIMECREATED --sort-order DESC --all"
     }
     catch {
-        $x86_images = '[]'
+        $x86_images = '{"data":[]}'
     }
     
-    $script:ubuntu_image_ocid = safe_jq $x86_images '.[0].id' ''
-    $x86_name = safe_jq $x86_images '.[0].name' ''
+    $script:ubuntu_image_ocid = safe_jq $x86_images '.data.[0].id' ''
+    $x86_name = safe_jq $x86_images '.data.[0].display-name' ''
     
     if ($script:ubuntu_image_ocid -and $script:ubuntu_image_ocid -ne 'null') {
         print_success "  x86 image: $x86_name"
@@ -1279,14 +1753,14 @@ function fetch_ubuntu_images {
     # Fetch ARM Ubuntu image
     print_status "  Looking for ARM Ubuntu image..."
     try {
-        $arm_images = oci_cmd "compute image list --compartment-id $script:tenancy_ocid --operating-system 'Canonical Ubuntu' --shape '$FREE_TIER_ARM_SHAPE' --sort-by TIMECREATED --sort-order DESC --query 'data[].{id:id,name:\"display-name\"}' --all"
+        $arm_images = oci_cmd "compute image list --compartment-id $script:tenancy_ocid --operating-system 'Canonical Ubuntu' --shape '$FREE_TIER_ARM_SHAPE' --sort-by TIMECREATED --sort-order DESC --all"
     }
     catch {
-        $arm_images = '[]'
+        $arm_images = '{"data":[]}'
     }
     
-    $script:ubuntu_arm_flex_image_ocid = safe_jq $arm_images '.[0].id' ''
-    $arm_name = safe_jq $arm_images '.[0].name' ''
+    $script:ubuntu_arm_flex_image_ocid = safe_jq $arm_images '.data.[0].id' ''
+    $arm_name = safe_jq $arm_images '.data.[0].display-name' ''
     
     if ($script:ubuntu_arm_flex_image_ocid -and $script:ubuntu_arm_flex_image_ocid -ne 'null') {
         print_success "  ARM image: $arm_name"
@@ -1304,11 +1778,12 @@ function generate_ssh_keys {
     $ssh_dir = 'ssh_keys'
     New-Item -ItemType Directory -Path $ssh_dir -Force | Out-Null
     
-    if (!(Test-Path "$ssh_dir\id_rsa")) {
+    $keyPath = Join-Path $ssh_dir 'id_rsa'
+    $pubPath = Join-Path $ssh_dir 'id_rsa.pub'
+    
+    if (!(Test-Path $keyPath)) {
         print_status "Generating new SSH key pair..."
-        & ssh-keygen -t rsa -b 4096 -f "$ssh_dir\id_rsa" -N '' -q
-        # Set permissions
-        # In Windows, permissions are different
+        & ssh-keygen -t rsa -b 4096 -f $keyPath -N '' -q
         print_success "SSH key pair generated at $ssh_dir/"
     }
     else {
@@ -1316,15 +1791,15 @@ function generate_ssh_keys {
     }
     
     # exported for Terraform/template consumption
-    $script:ssh_public_key = Get-Content "$ssh_dir\id_rsa.pub" -Raw
+    $script:ssh_public_key = Get-Content $pubPath -Raw
 }
 
 # ============================================================================
-# COMPREHENSIVE RESOURCE INVENTORY
+# RESOURCE INVENTORY
 # ============================================================================
 
 function inventory_all_resources {
-    print_header "COMPREHENSIVE RESOURCE INVENTORY"
+    print_header "RESOURCE INVENTORY"
     print_status "Scanning all existing OCI resources in tenancy..."
     print_status "This ensures we never create duplicate resources."
     Write-Host ""
@@ -1684,7 +2159,7 @@ function display_resource_inventory {
     
     $total_storage = $total_boot_gb + $total_block_gb
     
-    Write-Host -ForegroundColor $BOLD "Compute Resources:$($NC)"
+    Write-Host "$($BOLD)Compute Resources:$($NC)"
     Write-Host "  ┌─────────────────────────────────────────────────────────────┐"
     Write-Host "  │ AMD Micro Instances:  $total_amd / $FREE_TIER_MAX_AMD_INSTANCES (Free Tier limit)          │"
     Write-Host "  │ ARM A1 Instances:     $total_arm / $FREE_TIER_MAX_ARM_INSTANCES (up to)                    │"
@@ -1692,14 +2167,14 @@ function display_resource_inventory {
     Write-Host "  │ ARM Memory Used:      ${total_arm_memory}GB / ${FREE_TIER_MAX_ARM_MEMORY_GB}GB                         │"
     Write-Host "  └─────────────────────────────────────────────────────────────┘"
     Write-Host ""
-    Write-Host -ForegroundColor $BOLD "Storage Resources:$($NC)"
+    Write-Host "$($BOLD)Storage Resources:$($NC)"
     Write-Host "  ┌─────────────────────────────────────────────────────────────┐"
     Write-Host "  │ Boot Volumes:         ${total_boot_gb}GB                                    │"
     Write-Host "  │ Block Volumes:        ${total_block_gb}GB                                    │"
     Write-Host ("  │ Total Storage:        {0,3}GB / {1,3}GB Free Tier limit          │" -f $total_storage, $FREE_TIER_MAX_STORAGE_GB)
     Write-Host "  └─────────────────────────────────────────────────────────────┘"
     Write-Host ""
-    Write-Host -ForegroundColor $BOLD "Networking Resources:$($NC)"
+    Write-Host "$($BOLD)Networking Resources:$($NC)"
     Write-Host "  ┌─────────────────────────────────────────────────────────────┐"
     Write-Host "  │ VCNs:                 $($script:EXISTING_VCNS.Count) / $FREE_TIER_MAX_VCNS (Free Tier limit)             │"
     Write-Host "  │ Subnets:              $($script:EXISTING_SUBNETS.Count)                                       │"
@@ -1873,83 +2348,333 @@ function load_existing_config {
     return $true
 }
 
-function prompt_configuration {
-    print_header "INSTANCE CONFIGURATION"
-    
-    calculate_available_resources
-    
-    Write-Host -ForegroundColor $BOLD "Available Free Tier Resources:$($NC)"
-    Write-Host "  • AMD instances:  $script:AVAILABLE_AMD_INSTANCES available (max $FREE_TIER_MAX_AMD_INSTANCES)"
-    Write-Host "  • ARM OCPUs:      $script:AVAILABLE_ARM_OCPUS available (max $FREE_TIER_MAX_ARM_OCPUS)"
-    Write-Host "  • ARM Memory:     $($script:AVAILABLE_ARM_MEMORY)GB available (max $($FREE_TIER_MAX_ARM_MEMORY_GB)GB)"
-    Write-Host "  • Storage:        $($script:AVAILABLE_STORAGE)GB available (max $($FREE_TIER_MAX_STORAGE_GB)GB)"
-    Write-Host ""
-    
-    # Check if we have existing config
-    $has_existing_config = load_existing_config
-    
-    print_status "Configuration options:"
-    Write-Host "  1) Use existing instances (manage what's already deployed)"
-    if ($has_existing_config) {
-        Write-Host "  2) Use saved configuration from variables.tf"
+function sum_numeric_tokens {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return 0
     }
-    else {
-        Write-Host "  2) Use saved configuration from variables.tf (not available)"
-    }
-    Write-Host "  3) Configure new instances (respecting Free Tier limits)"
-    Write-Host "  4) Maximum Free Tier configuration (use all available resources)"
-    Write-Host ""
-    
-    $choice = 0
-    while ($true) {
-        if ($AUTO_USE_EXISTING -eq 'true') {
-            $choice = 1
-            print_status "Auto mode: Using existing instances"
+
+    $sum = 0
+    foreach ($token in ($Value -split '\s+')) {
+        if ($token -match '^\d+$') {
+            $sum += [int]$token
         }
-        elseif ($NON_INTERACTIVE -eq 'true') {
-            $choice = 1
-            print_status "Non-interactive mode: Using existing instances"
+    }
+
+    return $sum
+}
+
+function get_deployed_state_summary {
+    $total_arm_ocpus = 0
+    $total_arm_memory = 0
+    foreach ($instance_data in $script:EXISTING_ARM_INSTANCES.Values) {
+        $parts = $instance_data -split '\|'
+        if ($parts.Count -ge 7) {
+            $ocpus = 0
+            $memory = 0
+            [void][int]::TryParse($parts[5], [ref]$ocpus)
+            [void][int]::TryParse($parts[6], [ref]$memory)
+            $total_arm_ocpus += $ocpus
+            $total_arm_memory += $memory
+        }
+    }
+
+    $total_boot_gb = 0
+    foreach ($boot_data in $script:EXISTING_BOOT_VOLUMES.Values) {
+        $parts = $boot_data -split '\|'
+        if ($parts.Count -ge 2) {
+            $size = 0
+            [void][int]::TryParse($parts[1], [ref]$size)
+            $total_boot_gb += $size
+        }
+    }
+
+    $total_block_gb = 0
+    foreach ($block_data in $script:EXISTING_BLOCK_VOLUMES.Values) {
+        $parts = $block_data -split '\|'
+        if ($parts.Count -ge 2) {
+            $size = 0
+            [void][int]::TryParse($parts[1], [ref]$size)
+            $total_block_gb += $size
+        }
+    }
+
+    return @{
+        AmdCount    = [int]$script:EXISTING_AMD_INSTANCES.Count
+        ArmCount    = [int]$script:EXISTING_ARM_INSTANCES.Count
+        ArmOcpus    = $total_arm_ocpus
+        ArmMemoryGb = $total_arm_memory
+        StorageGb   = ($total_boot_gb + $total_block_gb)
+        Vcns        = [int]$script:EXISTING_VCNS.Count
+    }
+}
+
+function get_desired_config_summary {
+    $arm_boot_total = sum_numeric_tokens $script:arm_flex_boot_volume_size_gb
+    $amd_boot_total = [int]$script:amd_micro_instance_count * [int]$script:amd_micro_boot_volume_size_gb
+
+    $amd = [int]$script:amd_micro_instance_count
+    $arm = [int]$script:arm_flex_instance_count
+    $armOcpus = sum_numeric_tokens $script:arm_flex_ocpus_per_instance
+    $armMemory = sum_numeric_tokens $script:arm_flex_memory_per_instance
+    $storage = $amd_boot_total + $arm_boot_total
+
+    return @{
+        AmdCount    = $amd
+        ArmCount    = $arm
+        ArmOcpus    = $armOcpus
+        ArmMemoryGb = $armMemory
+        StorageGb   = $storage
+        IsEmpty     = ($amd -eq 0 -and $arm -eq 0 -and $armOcpus -eq 0 -and $armMemory -eq 0)
+    }
+}
+
+function get_config_drift_summary {
+    param(
+        [hashtable]$Deployed,
+        [hashtable]$Desired
+    )
+
+    if ($Desired.IsEmpty) {
+        return "Desired config not set yet"
+    }
+
+    $diff = @()
+    if ($Desired.AmdCount -ne $Deployed.AmdCount) { $diff += "AMD count" }
+    if ($Desired.ArmCount -ne $Deployed.ArmCount) { $diff += "ARM count" }
+    if ($Desired.ArmOcpus -ne $Deployed.ArmOcpus) { $diff += "ARM OCPUs" }
+    if ($Desired.ArmMemoryGb -ne $Deployed.ArmMemoryGb) { $diff += "ARM memory" }
+
+    if ($diff.Count -eq 0) {
+        return "Desired config matches deployed compute shape"
+    }
+
+    return "Differences detected: " + ($diff -join ', ')
+}
+
+function get_desired_config_signature {
+    return "amd=$($script:amd_micro_instance_count)|amdBoot=$($script:amd_micro_boot_volume_size_gb)|arm=$($script:arm_flex_instance_count)|armOcpus=$($script:arm_flex_ocpus_per_instance)|armMem=$($script:arm_flex_memory_per_instance)|armBoot=$($script:arm_flex_boot_volume_size_gb)|amdHosts=$($script:amd_micro_hostnames -join ',')|armHosts=$($script:arm_flex_hostnames -join ',')"
+}
+
+# ── Compact status display helpers ──
+
+function has_terraform_files {
+    return (Test-Path 'provider.tf') -and (Test-Path 'variables.tf') -and (Test-Path 'main.tf')
+}
+
+function get_config_one_liner {
+    if (-not $script:TUI_CONFIGURED) {
+        if (Test-Path 'variables.tf') { return '(variables.tf exists, not loaded yet)' }
+        return 'Not configured (defaults apply on first deploy)'
+    }
+
+    $parts = @()
+    if ([int]$script:arm_flex_instance_count -gt 0) {
+        $ocpus = $script:arm_flex_ocpus_per_instance
+        $mem = $script:arm_flex_memory_per_instance
+        $boot = $script:arm_flex_boot_volume_size_gb
+        $parts += "$($script:arm_flex_instance_count)x ARM ($ocpus OCPU, ${mem}GB RAM, ${boot}GB boot)"
+    }
+    if ([int]$script:amd_micro_instance_count -gt 0) {
+        $parts += "$($script:amd_micro_instance_count)x AMD (${script:amd_micro_boot_volume_size_gb}GB boot)"
+    }
+    if ($parts.Count -eq 0) { return 'Empty (no instances configured)' }
+    return $parts -join ' | '
+}
+
+function get_deployed_one_liner {
+    $d = get_deployed_state_summary
+    $parts = @()
+    if ($d.ArmCount -gt 0) { $parts += "$($d.ArmCount)x ARM ($($d.ArmOcpus) OCPU, $($d.ArmMemoryGb)GB)" }
+    if ($d.AmdCount -gt 0) { $parts += "$($d.AmdCount)x AMD" }
+    $instances = if ($parts.Count -gt 0) { $parts -join ', ' } else { 'No instances' }
+    return "$instances | $($d.StorageGb)GB/$($FREE_TIER_MAX_STORAGE_GB)GB storage | $($d.Vcns)/$($FREE_TIER_MAX_VCNS) VCNs"
+}
+
+function get_files_one_liner {
+    $files = @('provider.tf', 'variables.tf', 'main.tf', 'data_sources.tf')
+    $existing = @($files | Where-Object { Test-Path $_ })
+    if ($existing.Count -eq 0) { return 'No .tf files (generated on first deploy)' }
+    $stale = if ($script:TUI_CONFIGURED -and -not $script:TUI_TERRAFORM_FILES_READY) { ' [config changed - regenerate needed]' } else { '' }
+    return "$($existing -join ', ')$stale"
+}
+
+function show_compact_status {
+    $profileText = if ([string]::IsNullOrWhiteSpace($OCI_PROFILE)) { 'DEFAULT' } else { $OCI_PROFILE }
+    $regionText = if ([string]::IsNullOrWhiteSpace($script:region)) { 'not set' } else { $script:region }
+    $authText = if ($script:TUI_BOOTSTRAPPED) { "${GREEN}Authenticated${NC}" } else { "${YELLOW}Not authenticated${NC}" }
+
+    Write-Host "  $($BOLD)Session:$($NC)  $profileText @ $regionText | $authText"
+    Write-Host "  $($BOLD)Config:$($NC)   $(get_config_one_liner)"
+    Write-Host "  $($BOLD)Live:$($NC)     $(get_deployed_one_liner)"
+    Write-Host "  $($BOLD)Files:$($NC)    $(get_files_one_liner)"
+    Write-Host ""
+}
+
+# ── Auto-configuration: loads config without prompts ──
+
+function apply_default_config {
+    $script:amd_micro_instance_count = 0
+    $script:amd_micro_boot_volume_size_gb = 50
+    $script:amd_micro_hostnames = @()
+    $script:arm_flex_instance_count = 1
+    $script:arm_flex_ocpus_per_instance = '4'
+    $script:arm_flex_memory_per_instance = '24'
+    $script:arm_flex_boot_volume_size_gb = '200'
+    $script:arm_flex_hostnames = @('arm-instance-1')
+    $script:arm_flex_block_volumes = @(0)
+    $script:TUI_CONFIGURED = $true
+    $script:TUI_TERRAFORM_FILES_READY = $false
+    print_status "Default config: 1x ARM (4 OCPU, 24GB RAM, 200GB boot)"
+}
+
+function auto_configure_if_needed {
+    if ($script:TUI_CONFIGURED) { return }
+
+    # Priority 1: load from existing variables.tf
+    if (Test-Path 'variables.tf') {
+        try {
+            if (load_existing_config) {
+                $script:TUI_CONFIGURED = $true
+                $script:TUI_TERRAFORM_FILES_READY = (has_terraform_files)
+                print_status "Config loaded from variables.tf"
+                return
+            }
+        } catch { }
+    }
+
+    # Priority 2: sync from deployed instances
+    if ($script:TUI_DISCOVERED -and ($script:EXISTING_AMD_INSTANCES.Count -gt 0 -or $script:EXISTING_ARM_INSTANCES.Count -gt 0)) {
+        configure_from_existing_instances
+        $script:TUI_CONFIGURED = $true
+        $script:TUI_TERRAFORM_FILES_READY = $false
+        print_status "Config synced from deployed instances"
+        return
+    }
+
+    # Priority 3: apply defaults
+    apply_default_config
+}
+
+# ── Deploy readiness: ensures .tf files exist for terraform ops ──
+
+function ensure_deploy_ready {
+    # If .tf files already exist and no config changes pending, use them as-is
+    if ((has_terraform_files) -and (-not $script:TUI_CONFIGURED -or $script:TUI_TERRAFORM_FILES_READY)) {
+        # Load config from variables.tf so status display is accurate
+        if (-not $script:TUI_CONFIGURED -and (Test-Path 'variables.tf')) {
+            try { load_existing_config | Out-Null; $script:TUI_CONFIGURED = $true } catch { }
+        }
+        $script:TUI_TERRAFORM_FILES_READY = $true
+        return
+    }
+
+    # Need to discover + configure + generate
+    if (-not $script:TUI_DISCOVERED) { refresh_discovery_context }
+    auto_configure_if_needed
+    if (-not $script:TUI_TERRAFORM_FILES_READY) {
+        create_terraform_files
+        $script:TUI_TERRAFORM_FILES_READY = $true
+    }
+}
+
+# ── Plan-only workflow (no apply) ──
+
+function terraform_init_and_plan {
+    print_subheader "Terraform Plan"
+
+    print_status "Initializing..."
+    & terraform init -upgrade 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'terraform init failed' }
+    print_success "Initialized"
+
+    # Import existing resources if discovered
+    if ($script:TUI_DISCOVERED -and ($script:EXISTING_VCNS.Count -gt 0 -or $script:EXISTING_AMD_INSTANCES.Count -gt 0 -or $script:EXISTING_ARM_INSTANCES.Count -gt 0)) {
+        print_status "Importing existing resources..."
+        import_existing_resources
+    }
+
+    print_status "Validating..."
+    & terraform validate 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'terraform validate failed' }
+    print_success "Valid"
+
+    print_status "Planning..."
+    Remove-Item tfplan -ErrorAction SilentlyContinue
+    & terraform plan -out=tfplan
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'tfplan')) { throw 'terraform plan failed' }
+    Write-Host ""
+    print_success "Plan saved to tfplan. Review above, then use Deploy to apply."
+}
+
+# ── Inline configuration editor ──
+
+function edit_configuration {
+    if (-not $script:TUI_DISCOVERED) {
+        bootstrap_tui_runtime
+        refresh_discovery_context
+    }
+    calculate_available_resources
+
+    Write-Host ""
+    Write-Host "  $($BOLD)Current config:$($NC) $(get_config_one_liner)"
+    Write-Host "  $($BOLD)Free Tier available:$($NC) AMD=$script:AVAILABLE_AMD_INSTANCES, ARM OCPU=$script:AVAILABLE_ARM_OCPUS, Memory=$($script:AVAILABLE_ARM_MEMORY)GB, Storage=$($script:AVAILABLE_STORAGE)GB"
+    Write-Host ""
+    Write-Host "  1) Custom          interactive prompts for each instance"
+    Write-Host "  2) Max Free Tier   use all available resources"
+    Write-Host "  3) Sync deployed   match what is currently running"
+    Write-Host "  4) Load saved      reload from variables.tf"
+    Write-Host "  5) Reset defaults  1x ARM, 4 OCPU, 24GB RAM, 200GB boot"
+    Write-Host "  0) Cancel"
+    Write-Host ""
+
+    $choice = read_menu_choice "Choose" 0 5 1 @{
+        c = 1; custom = 1
+        m = 2; max = 2
+        s = 3; sync = 3
+        l = 4; load = 4
+        d = 5; defaults = 5; reset = 5
+        b = 0; cancel = 0; q = 0
+    }
+
+    switch ($choice) {
+        0 { return }
+        1 { configure_custom_instances }
+        2 { configure_maximum_free_tier }
+        3 { configure_from_existing_instances }
+        4 {
+            if (-not (load_existing_config)) {
+                print_error "Could not load variables.tf"
+                pause_tui
+                return
+            }
+            print_success "Config loaded from variables.tf"
+        }
+        5 { apply_default_config }
+    }
+
+    $script:TUI_CONFIGURED = $true
+    $script:TUI_TERRAFORM_FILES_READY = $false
+
+    Write-Host ""
+    Write-Host "  $($BOLD)Updated config:$($NC) $(get_config_one_liner)"
+
+    # Auto-regenerate or prompt
+    if (has_terraform_files) {
+        if (confirm_action "  Regenerate .tf files with new config?" 'Y') {
+            create_terraform_files
+            $script:TUI_TERRAFORM_FILES_READY = $true
+            print_success "Terraform files regenerated"
         }
         else {
-            $raw_choice = prompt_with_default "Choose configuration (1-4)" "1"
-            $raw_choice = $raw_choice -replace '\r', '' -replace '^\s+', '' -replace '\s+$', ''
-            if ($raw_choice -match '^[0-9]+$' -and [int]$raw_choice -ge 1 -and [int]$raw_choice -le 4) {
-                $choice = [int]$raw_choice
-            }
-            else {
-                print_error "Please enter a number between 1 and 4 (received: '$raw_choice')"
-                continue
-            }
+            print_status "Files not regenerated yet. Use Regenerate (4) when ready."
         }
-        
-        switch ($choice) {
-            1 {
-                configure_from_existing_instances
-                break
-            }
-            2 {
-                if ($has_existing_config) {
-                    print_success "Using saved configuration"
-                    break
-                }
-                else {
-                    print_error "No saved configuration available"
-                    continue
-                }
-            }
-            3 {
-                configure_custom_instances
-                break
-            }
-            4 {
-                configure_maximum_free_tier
-                break
-            }
-            default {
-                print_error "Invalid choice"
-                continue
-            }
-        }
+    }
+    else {
+        create_terraform_files
+        $script:TUI_TERRAFORM_FILES_READY = $true
+        print_success "Terraform files generated"
     }
 }
 
@@ -1982,7 +2707,7 @@ function configure_from_existing_instances {
         $script:arm_flex_hostnames += $name
         $script:arm_flex_ocpus_per_instance += "$ocpus "
         $script:arm_flex_memory_per_instance += "$memory "
-        $script:arm_flex_boot_volume_size_gb += "50 "  # Default, will be updated from state
+        $script:arm_flex_boot_volume_size_gb += "200 "  # Default, will be updated from state
         $script:arm_flex_block_volumes += 0
     }
     
@@ -1994,13 +2719,40 @@ function configure_from_existing_instances {
     # Set defaults if no instances exist
     if ($script:amd_micro_instance_count -eq 0 -and $script:arm_flex_instance_count -eq 0) {
         print_status "No existing instances found, using default configuration"
-        $script:amd_micro_instance_count = 0
-        $script:arm_flex_instance_count = 1
-        $script:arm_flex_ocpus_per_instance = '4'
-        $script:arm_flex_memory_per_instance = '24'
-        $script:arm_flex_boot_volume_size_gb = '200'
-        $script:arm_flex_hostnames = @('arm-instance-1')
-        $script:arm_flex_block_volumes = @(0)
+
+        $armImageAvailable = -not [string]::IsNullOrWhiteSpace($script:ubuntu_arm_flex_image_ocid)
+        $amdImageAvailable = -not [string]::IsNullOrWhiteSpace($script:ubuntu_image_ocid)
+
+        if ($armImageAvailable -and $script:AVAILABLE_ARM_OCPUS -gt 0) {
+            $script:amd_micro_instance_count = 0
+            $script:arm_flex_instance_count = 1
+            $script:arm_flex_ocpus_per_instance = '4'
+            $script:arm_flex_memory_per_instance = '24'
+            $script:arm_flex_boot_volume_size_gb = '200'
+            $script:arm_flex_hostnames = @('arm-instance-1')
+            $script:arm_flex_block_volumes = @(0)
+        }
+        elseif ($amdImageAvailable -and $script:AVAILABLE_AMD_INSTANCES -gt 0) {
+            $script:amd_micro_instance_count = 1
+            $script:amd_micro_hostnames = @('amd-instance-1')
+            $script:arm_flex_instance_count = 0
+            $script:arm_flex_ocpus_per_instance = ''
+            $script:arm_flex_memory_per_instance = ''
+            $script:arm_flex_boot_volume_size_gb = ''
+            $script:arm_flex_hostnames = @()
+            $script:arm_flex_block_volumes = @()
+        }
+        else {
+            print_warning "No eligible Ubuntu image found for AMD or ARM. Skipping compute instance creation."
+            $script:amd_micro_instance_count = 0
+            $script:amd_micro_hostnames = @()
+            $script:arm_flex_instance_count = 0
+            $script:arm_flex_ocpus_per_instance = ''
+            $script:arm_flex_memory_per_instance = ''
+            $script:arm_flex_boot_volume_size_gb = ''
+            $script:arm_flex_hostnames = @()
+            $script:arm_flex_block_volumes = @()
+        }
     }
     
     $script:amd_micro_boot_volume_size_gb = 50
@@ -2064,7 +2816,7 @@ function configure_custom_instances {
             $script:arm_flex_memory_per_instance += "$memory "
             $remaining_memory -= $memory
 
-            $boot = prompt_int_range "  Boot volume GB (50-200)" "50" 50 200
+            $boot = prompt_int_range "  Boot volume GB (50-200)" "200" 50 200
             $script:arm_flex_boot_volume_size_gb += "$boot "
             
             $script:arm_flex_block_volumes += 0
@@ -2135,6 +2887,9 @@ function create_terraform_files {
     create_terraform_main
     create_terraform_block_volumes
     create_cloud_init
+
+    $script:LAST_GENERATED_CONFIG_SIGNATURE = get_desired_config_signature
+    $script:TUI_LAST_ACTION = 'Generated Terraform files'
     
     print_success "All Terraform files generated successfully"
 }
@@ -2293,21 +3048,21 @@ variable "free_tier_max_arm_memory_gb" {
 check "storage_limit" {
     assert {
         condition     = local.total_storage <= var.free_tier_max_storage_gb
-        error_message = "Total storage (\${local.total_storage}GB) exceeds Free Tier limit (\${var.free_tier_max_storage_gb}GB)"
+        error_message = "Total storage (${local.total_storage}GB) exceeds Free Tier limit (${var.free_tier_max_storage_gb}GB)"
     }
 }
 
 check "arm_ocpu_limit" {
     assert {
         condition     = local.arm_flex_instance_count == 0 || sum(local.arm_flex_ocpus_per_instance) <= var.free_tier_max_arm_ocpus
-        error_message = "Total ARM OCPUs exceed Free Tier limit (\${var.free_tier_max_arm_ocpus})"
+        error_message = "Total ARM OCPUs exceed Free Tier limit (${var.free_tier_max_arm_ocpus})"
     }
 }
 
 check "arm_memory_limit" {
     assert {
         condition     = local.arm_flex_instance_count == 0 || sum(local.arm_flex_memory_per_instance) <= var.free_tier_max_arm_memory_gb
-        error_message = "Total ARM memory exceeds Free Tier limit (\${var.free_tier_max_arm_memory_gb}GB)"
+        error_message = "Total ARM memory exceeds Free Tier limit (${var.free_tier_max_arm_memory_gb}GB)"
     }
 }
 '@
@@ -2806,7 +3561,6 @@ packages:
   - htop
   - vim
   - unzip
-  - jq
   - tmux
   - net-tools
   - iotop
@@ -2850,7 +3604,7 @@ function import_existing_resources {
     
     # Initialize Terraform first
     print_status "Initializing Terraform..."
-    & terraform init -input=false 2>&1 | Out-Null
+    & terraform init 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) {
         print_error "Terraform init failed after retries"
         throw "Terraform init failed"
@@ -3006,180 +3760,237 @@ function import_vcn_components {
 # TERRAFORM WORKFLOW
 # ============================================================================
 
-function run_terraform_workflow {
-    print_header "TERRAFORM WORKFLOW"
-    
-    # Step 1: Initialize
-    print_status "Step 1: Initializing Terraform..."
+function pause_tui {
+    Read-Host "$($BLUE)Press Enter to continue...$($NC)" | Out-Null
+}
+
+function clear_tui_screen {
+    if ($TUI_CLEAR_SCREEN -eq 'true') {
+        Clear-Host
+    }
+}
+
+function confirm_destructive_action {
+    param([string]$Label)
+
+    print_warning "$Label"
+    $value = Read-Host "$($YELLOW)Type DESTROY to confirm, or press Enter to cancel:$($NC)"
+    $value = if ([string]::IsNullOrWhiteSpace($value)) { '' } else { $value.Trim().ToUpperInvariant() }
+    return ($value -eq 'DESTROY')
+}
+
+function read_menu_choice {
+    param(
+        [string]$Prompt,
+        [int]$Min,
+        [int]$Max,
+        [int]$Default = 1,
+        [hashtable]$Aliases = $null
+    )
+
+    while ($true) {
+        $raw = Read-Host "$($BLUE)$Prompt [$Default]: $($NC)"
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $Default
+        }
+
+        $normalized = $raw.Trim().ToLowerInvariant()
+        if ($normalized -eq 'help' -or $normalized -eq 'h' -or $normalized -eq '?') {
+            if ($Aliases -and $Aliases.Count -gt 0) {
+                $aliasKeys = ($Aliases.Keys | Sort-Object) -join ', '
+                print_status "Valid inputs: $Min-$Max, or: $aliasKeys"
+            }
+            else {
+                print_status "Valid inputs: $Min-$Max"
+            }
+            continue
+        }
+        if ($Aliases -and $Aliases.ContainsKey($normalized)) {
+            return [int]$Aliases[$normalized]
+        }
+
+        if ($normalized -match '^\d+$') {
+            $value = [int]$normalized
+            if ($value -ge $Min -and $value -le $Max) {
+                return $value
+            }
+        }
+
+        if ($Aliases -and $Aliases.Count -gt 0) {
+            $aliasKeys = ($Aliases.Keys | Sort-Object) -join ', '
+            print_error "Enter $Min-$Max or one of: $aliasKeys"
+        }
+        else {
+            print_error "Please enter a number between $Min and $Max"
+        }
+    }
+}
+
+function show_tfplan_summary {
+    if (-not (Test-Path 'tfplan')) {
+        print_status "No saved plan found."
+        return
+    }
+
+    print_subheader "Saved Plan Summary"
     try {
-        & terraform init -input=false -upgrade 2>&1 | Out-Null
+        & terraform show -no-color tfplan 2>&1 | Select-String -Pattern '^(Plan:|  #|will be)' | Select-Object -First 30
     }
     catch {
-        print_error "Terraform init failed after retries"
-        throw "Terraform init failed"
+        print_warning "Could not render summary."
+        & terraform show tfplan
     }
-    print_success "Terraform initialized"
-    
-    # Step 2: Import existing resources
-    if ($script:EXISTING_VCNS.Count -gt 0 -or $script:EXISTING_AMD_INSTANCES.Count -gt 0 -or $script:EXISTING_ARM_INSTANCES.Count -gt 0) {
-        print_status "Step 2: Importing existing resources..."
+}
+
+function show_terraform_state_and_outputs {
+    print_subheader "Terraform State"
+    & terraform state list
+    if ($LASTEXITCODE -ne 0) {
+        print_status "No Terraform state found (not initialized yet)"
+        return
+    }
+
+    print_subheader "Terraform Outputs"
+    try {
+        & terraform output -json | ConvertFrom-Json | ConvertTo-Json
+    }
+    catch {
+        & terraform output
+    }
+
+    if (Test-Path 'tfplan') {
+        show_tfplan_summary
+    }
+}
+
+function ensure_venv_activation {
+    $venvBin = if ($IsWindows -or (-not $IsLinux -and -not $IsMacOS)) { 'Scripts' } else { 'bin' }
+    $activatePs1 = Join-Path $PWD '.venv' $venvBin 'Activate.ps1'
+    if (Test-Path $activatePs1) {
+        & $activatePs1
+    }
+}
+
+function invoke_tui_phase {
+    param(
+        [string]$Title,
+        [scriptblock]$Action
+    )
+
+    print_status "$Title..."
+
+    $originalLogLevel = $LOG_LEVEL
+    $useConcise = ($TUI_CONCISE_LOGS -eq 'true')
+    if ($useConcise) {
+        $script:LOG_LEVEL = 'WARNING'
+    }
+
+    try {
+        & $Action
+        print_success "$Title completed"
+    }
+    catch {
+        print_error "$Title failed: $_"
+        throw
+    }
+    finally {
+        if ($useConcise) {
+            $script:LOG_LEVEL = $originalLogLevel
+        }
+    }
+}
+
+function bootstrap_tui_runtime {
+    if ($script:TUI_BOOTSTRAPPED) {
+        return
+    }
+
+    print_subheader "Bootstrap & Authentication"
+
+    invoke_tui_phase "Preparing local toolchain" {
+        install_prerequisites
+        install_terraform
+        install_oci_cli
+    }
+
+    invoke_tui_phase "Authenticating with OCI" {
+        ensure_venv_activation
+        setup_oci_config
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:region)) {
+        $regionHint = read_oci_config_value 'region' $OCI_CONFIG_FILE $OCI_PROFILE
+        if (-not [string]::IsNullOrWhiteSpace($regionHint)) {
+            $script:region = normalize_auth_region $regionHint
+        }
+    }
+
+    $script:TUI_BOOTSTRAPPED = $true
+    print_success "Bootstrap ready (Profile=$OCI_PROFILE, Region=$(if ([string]::IsNullOrWhiteSpace($script:region)) { 'unknown' } else { $script:region }))"
+}
+
+function refresh_discovery_context {
+    bootstrap_tui_runtime
+
+    print_subheader "Discovery & Inventory"
+    invoke_tui_phase "Refreshing OCI discovery context" {
+        fetch_oci_config_values
+        fetch_availability_domains
+        fetch_ubuntu_images
+        generate_ssh_keys
+        inventory_all_resources
+    }
+
+    $script:TUI_DISCOVERED = $true
+    $script:TUI_CONFIGURED = $false
+    $script:TUI_TERRAFORM_FILES_READY = $false
+    print_success "Discovery ready (Region=$script:region, AMD=$($script:EXISTING_AMD_INSTANCES.Count), ARM=$($script:EXISTING_ARM_INSTANCES.Count), VCNs=$($script:EXISTING_VCNS.Count))"
+}
+
+function run_terraform_workflow {
+    print_subheader "Deploy"
+
+    # Init
+    print_status "Initializing Terraform..."
+    & terraform init -upgrade 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'terraform init failed' }
+    print_success "Initialized"
+
+    # Import existing resources if we discovered any
+    if ($script:TUI_DISCOVERED -and ($script:EXISTING_VCNS.Count -gt 0 -or $script:EXISTING_AMD_INSTANCES.Count -gt 0 -or $script:EXISTING_ARM_INSTANCES.Count -gt 0)) {
+        print_status "Importing existing resources..."
         import_existing_resources
     }
-    else {
-        print_status "Step 2: No existing resources to import"
-    }
-    
-    # Step 3: Validate
-    print_status "Step 3: Validating configuration..."
-    try {
-        & terraform validate 2>&1 | Out-Null
-    }
-    catch {
-        print_error "Terraform validation failed"
-        throw "Terraform validation failed"
-    }
-    print_success "Configuration valid"
-    
-    # Step 4: Plan
-    print_status "Step 4: Creating execution plan..."
-    try {
-        & terraform plan -out=tfplan -input=false 2>&1 | Out-Null
-    }
-    catch {
-        print_error "Terraform plan failed"
-        throw "Terraform plan failed"
-    }
-    print_success "Plan created successfully"
-    
-    # Show plan summary
+
+    # Validate
+    print_status "Validating..."
+    & terraform validate 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'terraform validate failed' }
+    print_success "Valid"
+
+    # Plan
+    print_status "Planning..."
+    Remove-Item tfplan -ErrorAction SilentlyContinue
+    & terraform plan -out=tfplan
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'tfplan')) { throw 'terraform plan failed' }
+    print_success "Plan created"
     Write-Host ""
-    print_status "Plan summary:"
-    try {
-        & terraform show -no-color tfplan 2>&1 | Select-String -Pattern '^(Plan:|  #|will be)' | Select-Object -First 20
-    }
-    catch { }
-    Write-Host ""
-    
-    # Step 5: Apply (with confirmation)
-    if ($AUTO_DEPLOY -eq 'true' -or $NON_INTERACTIVE -eq 'true') {
-        print_status "Step 5: Auto-applying plan..."
-        $apply_choice = 'Y'
-    }
-    else {
-        $apply_choice = Read-Host "$($BLUE)Apply this plan? [y/N]: $($NC)"
-        $apply_choice = if ([string]::IsNullOrEmpty($apply_choice)) { 'N' } else { $apply_choice }
-    }
-    
-    if ($apply_choice -match '^[Yy]$') {
-        print_status "Applying Terraform plan..."
+
+    # Apply (with confirmation)
+    if (confirm_action "Apply this plan now?" 'Y') {
+        print_status "Applying..."
         if (out_of_capacity_auto_apply) {
             print_success "Infrastructure deployed successfully!"
             Remove-Item tfplan -ErrorAction SilentlyContinue
-            
-            # Show outputs
             Write-Host ""
-            print_header "DEPLOYMENT COMPLETE"
-            try {
-                & terraform output -json | ConvertFrom-Json | ConvertTo-Json
-            }
-            catch {
-                & terraform output
-            }
+            try { & terraform output } catch { }
         }
         else {
             print_error "Terraform apply failed"
-            throw "Terraform apply failed"
         }
     }
     else {
-        print_status "Plan saved as 'tfplan' - apply later with: terraform apply tfplan"
-    }
-    
-    return $true
-}
-
-function terraform_menu {
-    while ($true) {
-        Write-Host ""
-        print_header "TERRAFORM MANAGEMENT"
-        Write-Host "  1) Full workflow (init → import → plan → apply)"
-        Write-Host "  2) Plan only"
-        Write-Host "  3) Apply existing plan"
-        Write-Host "  4) Import existing resources"
-        Write-Host "  5) Show current state"
-        Write-Host "  6) Destroy infrastructure"
-        Write-Host "  7) Reconfigure"
-        Write-Host "  8) Exit"
-        Write-Host ""
-        
-        if ($AUTO_DEPLOY -eq 'true' -or $NON_INTERACTIVE -eq 'true') {
-            $choice = 1
-            print_status "Auto mode: Running full workflow"
-        }
-        else {
-            $raw_choice = Read-Host "$($BLUE)Choose option [1]: $($NC)"
-            $choice = if ([string]::IsNullOrEmpty($raw_choice)) { 1 } else { [int]$raw_choice }
-        }
-        
-        switch ($choice) {
-            1 {
-                run_terraform_workflow
-                if ($AUTO_DEPLOY -eq 'true') { return $true }
-            }
-            2 {
-                try {
-                    & terraform init -input=false
-                    & terraform plan
-                }
-                catch {
-                    print_error "Terraform plan failed"
-                }
-            }
-            3 {
-                if (Test-Path 'tfplan') {
-                    & terraform apply tfplan 2>&1 | Out-Null
-                }
-                else {
-                    print_error "No plan file found"
-                }
-            }
-            4 {
-                import_existing_resources
-            }
-            5 {
-                & terraform state list 2>&1 | Out-Null
-                $state_ok = ($LASTEXITCODE -eq 0)
-                & terraform output 2>&1 | Out-Null
-                $output_ok = ($LASTEXITCODE -eq 0)
-                if ($state_ok -and $output_ok) {
-                    $null
-                }
-                else {
-                    print_status "No state found"
-                }
-            }
-            6 {
-                if (confirm_action "DESTROY all infrastructure?" 'N') {
-                    & terraform destroy 2>&1 | Out-Null
-                }
-            }
-            7 {
-                return $false  # Signal to reconfigure
-            }
-            8 {
-                return $true
-            }
-            default {
-                print_error "Invalid choice"
-            }
-        }
-        
-        if ($NON_INTERACTIVE -eq 'true') {
-            return $true
-        }
-        
-        Write-Host ""
-        Read-Host "$($BLUE)Press Enter to continue...$($NC)"
+        print_status "Plan saved as 'tfplan'. Apply later with: terraform apply tfplan"
     }
 }
 
@@ -3188,72 +3999,187 @@ function terraform_menu {
 # ============================================================================
 
 function main {
-    print_header "OCI TERRAFORM SETUP - IDEMPOTENT EDITION"
-    print_status "This script safely manages Oracle Cloud Free Tier resources"
-    print_status "Safe to run multiple times - will detect and reuse existing resources"
-    Write-Host ""
-    
-    # Phase 1: Prerequisites
-    install_prerequisites
-    install_terraform
-    install_oci_cli
-    
-    # Activate virtual environment if it exists
-    if (Test-Path '.venv\Scripts\Activate.ps1') {
-        & .venv\Scripts\Activate.ps1
-    }
-    
-    # Phase 2: Authentication
-    setup_oci_config
-    
-    # Phase 3: Fetch OCI information
-    fetch_oci_config_values
-    fetch_availability_domains
-    fetch_ubuntu_images
-    generate_ssh_keys
-    
-    # Phase 4: Resource inventory (CRITICAL for idempotency)
-    inventory_all_resources
-    
-    # Phase 5: Configuration
-    if ($SKIP_CONFIG -ne 'true') {
-        prompt_configuration
-    }
-    else {
-        if (!(load_existing_config)) {
-            configure_from_existing_instances
+    initialize_log_catalog
+    clear_tui_screen
+
+    # ── Quick pre-flight: detect tools + auth + load config (no prompts) ──
+    if ((command_exists 'oci') -and (command_exists 'terraform') -and (Test-Path $OCI_CONFIG_FILE)) {
+        detect_auth_method
+        if ($script:auth_method) {
+            $regionHint = read_oci_config_value 'region' $OCI_CONFIG_FILE $OCI_PROFILE
+            if (-not [string]::IsNullOrWhiteSpace($regionHint)) {
+                $script:region = normalize_auth_region $regionHint
+            }
+            $script:TUI_BOOTSTRAPPED = $true
         }
     }
-    
-    # Phase 6: Generate Terraform files
-    create_terraform_files
-    
-    # Phase 7: Terraform management
+
+    # Auto-load config from variables.tf if it exists
+    if (Test-Path 'variables.tf') {
+        try {
+            if (load_existing_config) {
+                $script:TUI_CONFIGURED = $true
+                $script:TUI_TERRAFORM_FILES_READY = (has_terraform_files)
+            }
+        } catch { }
+    }
+
+    # ── Main loop: single flat menu ──
     while ($true) {
-        if (terraform_menu) {
-            break
+        clear_tui_screen
+        print_header "OCI TERRAFORM MANAGER"
+        show_compact_status
+
+        # Smart default: deploy if ready, else regenerate if config changed, else edit
+        $defaultOpt = if ($script:TUI_CONFIGURED -and $script:TUI_TERRAFORM_FILES_READY) { 1 }
+                      elseif ($script:TUI_CONFIGURED) { 4 }
+                      else { 1 }
+
+        Write-Host "  1) Deploy           plan + apply (auto-retries capacity errors)"
+        Write-Host "  2) Plan only        preview changes without applying"
+        Write-Host "  3) Edit config      change instance types, counts, sizes"
+        Write-Host "  4) Regenerate       rebuild .tf files from current config"
+        Write-Host "  5) Show state       terraform state, outputs, saved plan"
+        Write-Host "  6) Import           import existing OCI resources to state"
+        Write-Host "  7) Destroy          tear down all managed infrastructure"
+        Write-Host "  8) Re-discover      re-scan OCI account for changes"
+        Write-Host "  0) Exit"
+        Write-Host ""
+        if ($TUI_SHOW_HINTS -eq 'true') {
+            Write-Host "  $($CYAN)Shortcuts: d=deploy, p=plan, e=edit, g=regen, s=state, i=import, r=refresh, q=exit, h=help$($NC)"
+            Write-Host "  $($CYAN)Deploy/Plan auto-bootstraps and generates files if needed.$($NC)"
+        }
+        Write-Host ""
+
+        $choice = read_menu_choice "Choose" 0 8 $defaultOpt @{
+            d = 1; deploy = 1; apply = 1
+            p = 2; plan = 2
+            e = 3; edit = 3; config = 3; c = 3
+            g = 4; regen = 4; regenerate = 4
+            s = 5; state = 5; status = 5; show = 5
+            i = 6; import = 6
+            x = 7; destroy = 7
+            r = 8; refresh = 8; discover = 8; scan = 8
+            q = 0; quit = 0; exit = 0
         }
 
-        # Reconfigure requested
-        prompt_configuration
-        create_terraform_files
+        switch ($choice) {
+            1 {
+                # Deploy: auto-chains bootstrap → discover → config → generate → plan → apply
+                try {
+                    bootstrap_tui_runtime
+                    ensure_deploy_ready
+                    run_terraform_workflow
+                }
+                catch {
+                    print_error "Deploy failed: $_"
+                }
+            }
+            2 {
+                # Plan only: same auto-chain but stops after plan
+                try {
+                    bootstrap_tui_runtime
+                    ensure_deploy_ready
+                    terraform_init_and_plan
+                }
+                catch {
+                    print_error "Plan failed: $_"
+                }
+            }
+            3 {
+                # Edit config: inline sub-menu, auto-regenerates after
+                try {
+                    edit_configuration
+                }
+                catch {
+                    print_error "Edit failed: $_"
+                }
+            }
+            4 {
+                # Regenerate .tf files from config
+                try {
+                    bootstrap_tui_runtime
+                    if (-not $script:TUI_DISCOVERED) { refresh_discovery_context }
+                    auto_configure_if_needed
+                    $doGenerate = $true
+                    if (has_terraform_files) {
+                        print_warning "This will overwrite existing .tf files."
+                        if (-not (confirm_action "Continue?" 'Y')) {
+                            print_status "Cancelled"
+                            $doGenerate = $false
+                        }
+                    }
+                    if ($doGenerate) {
+                        create_terraform_files
+                        $script:TUI_TERRAFORM_FILES_READY = $true
+                        print_success "Terraform files regenerated"
+                    }
+                }
+                catch {
+                    print_error "Regeneration failed: $_"
+                }
+            }
+            5 {
+                # Show terraform state + outputs + saved plan
+                try {
+                    show_terraform_state_and_outputs
+                }
+                catch {
+                    print_error "Could not read state: $_"
+                }
+            }
+            6 {
+                # Import existing OCI resources into terraform state
+                try {
+                    bootstrap_tui_runtime
+                    if (-not $script:TUI_DISCOVERED) { refresh_discovery_context }
+                    import_existing_resources
+                }
+                catch {
+                    print_error "Import failed: $_"
+                }
+            }
+            7 {
+                # Destroy all managed infrastructure
+                if (confirm_destructive_action "This will DESTROY all managed infrastructure.") {
+                    try {
+                        bootstrap_tui_runtime
+                        & terraform destroy
+                        if ($LASTEXITCODE -eq 0) {
+                            print_success "Infrastructure destroyed"
+                        }
+                        else {
+                            print_error "terraform destroy exited with code $LASTEXITCODE"
+                        }
+                    }
+                    catch {
+                        print_error "Destroy failed: $_"
+                    }
+                }
+                else {
+                    print_status "Cancelled"
+                }
+            }
+            8 {
+                # Re-discover: re-scan OCI account
+                try {
+                    refresh_discovery_context
+                }
+                catch {
+                    print_error "Discovery failed: $_"
+                }
+            }
+            0 {
+                # Exit
+                Write-Host ""
+                print_status "Goodbye."
+                return
+            }
+        }
+
+        Write-Host ""
+        pause_tui
     }
-    
-    print_header "SETUP COMPLETE"
-    print_success "Oracle Cloud Free Tier infrastructure managed successfully"
-    Write-Host ""
-    print_status "Files created/updated:"
-    print_status "  • provider.tf - OCI provider configuration"
-    print_status "  • variables.tf - Instance configuration"
-    print_status "  • main.tf - Infrastructure resources"
-    print_status "  • data_sources.tf - OCI data sources"
-    print_status "  • block_volumes.tf - Storage volumes"
-    print_status "  • cloud-init.yaml - Instance initialization"
-    Write-Host ""
-    print_status "To manage your infrastructure:"
-    print_status "  terraform plan    - Preview changes"
-    print_status "  terraform apply   - Apply changes"
-    print_status "  terraform destroy - Remove all resources"
 }
 
 # Execute

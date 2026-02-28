@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+"""Entry point for direct `python main.py` invocation."""
 from cloudbooter.cli import main
 
 if __name__ == "__main__":

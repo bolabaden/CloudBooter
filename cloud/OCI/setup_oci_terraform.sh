@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # Oracle Cloud Infrastructure (OCI) Terraform Setup Script
-# Idempotent, comprehensive implementation for Always Free Tier management
 #
 # Usage:
 #   Interactive mode:        ./setup_oci_terraform.sh
@@ -10,11 +9,6 @@
 #   Auto deploy only:        AUTO_DEPLOY=true ./setup_oci_terraform.sh
 #   Skip to deploy:          SKIP_CONFIG=true ./setup_oci_terraform.sh
 #
-# Key features:
-#   - Completely idempotent: safe to run multiple times
-#   - Comprehensive resource detection before any deployment
-#   - Strict Free Tier limit validation
-#   - Robust existing resource import
 
 set -euo pipefail
 #set -x
@@ -1306,11 +1300,11 @@ generate_ssh_keys() {
 }
 
 # ============================================================================
-# COMPREHENSIVE RESOURCE INVENTORY
+# RESOURCE INVENTORY
 # ============================================================================
 
 inventory_all_resources() {
-    print_header "COMPREHENSIVE RESOURCE INVENTORY"
+    print_header "RESOURCE INVENTORY"
     print_status "Scanning all existing OCI resources in tenancy..."
     print_status "This ensures we never create duplicate resources."
     echo ""
@@ -2939,9 +2933,8 @@ terraform_menu() {
 # ============================================================================
 
 main() {
-    print_header "OCI TERRAFORM SETUP - IDEMPOTENT EDITION"
+    print_header "OCI TERRAFORM SETUP"
     print_status "This script safely manages Oracle Cloud Free Tier resources"
-    print_status "Safe to run multiple times - will detect and reuse existing resources"
     echo ""
     
     # Phase 1: Prerequisites

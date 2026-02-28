@@ -22,8 +22,8 @@
    - `cloud-init.yaml` - Instance initialization scripts
 
 3. **Documentation**
-   - `OCI_FREE_TIER_GUIDE.md` - Complete limits reference (canonical source for constraints)
-   - `BASH_OCI_SETUP_USAGE.md` - User-facing workflows
+   - [FREE_TIER_LIMITS.md](../cloud/OCI/docs/FREE_TIER_LIMITS.md) - Complete limits reference (canonical source for constraints)
+   - [BASH OCI SETUP](../cloud/OCI/README.md) - User-facing workflows
 
 ### Data Flow
 
@@ -227,8 +227,16 @@ The script handles this gracefully but users must manage token lifecycle.
 
 - [setup_oci_terraform.sh](../cloud/OCI/setup_oci_terraform.sh) - Main script (source of truth for logic)
 - [FREE_TIER_LIMITS.md](../cloud/OCI/FREE_TIER_LIMITS.md) - Limits documentation
-- [main.tf](../main.tf) - Example generated Terraform (auto-generated, do not edit)
+- [main.tf](../cloud/OCI/main.tf) - Example generated Terraform (auto-generated, do not edit)
 - [.gitignore](../.gitignore) - Lists sensitive/generated files (terraform.tfstate, ssh_keys, *.tf)
+
+## Planning and Documentation Diagram Policy
+
+- Every new or updated planning/design document must include at least one Mermaid diagram.
+- The diagram should appear near the top (after objective/scope) and provide a high-level flow.
+- Keep diagrams synchronized with the written steps when plans evolve.
+- Prefer simple `flowchart TD` diagrams for execution plans and phase sequencing.
+- If a document has multiple phases/modules, include one top-level diagram plus optional focused diagrams.
 
 ## Contributing Conventions
 
@@ -237,3 +245,11 @@ The script handles this gracefully but users must manage token lifecycle.
 - **Testing**: Verify idempotency (run twice, expect same result); test with `NON_INTERACTIVE=true`
 - **Documentation**: Update both Bash constants and `.md` files when limits change
 - **Error handling**: Use `print_error()` for user-facing errors; let `set -e` propagate critical failures
+
+## Planning and Documentation Diagram Policy
+
+- Every new or updated planning/design document must include at least one Mermaid diagram.
+- The diagram should appear near the top (after objective/scope) and provide a high-level flow.
+- Keep diagrams synchronized with the written steps when plans evolve.
+- Prefer simple `flowchart TD` diagrams for execution plans and phase sequencing.
+- If a document has multiple phases/modules, include one top-level diagram plus optional focused diagrams.
